@@ -21,7 +21,7 @@ Use global `--json` before the command when structured output is useful:
 python3 stack.py --json show ABC-123
 ```
 
-Stack selectors can be the stack id, filename, filename stem, or a direct TOML path. PR selectors can be a PR id, ticket, branch, or GitHub PR number; `descendants` and `rebase-plan` also accept `stack-base`.
+Stack selectors can be the stack id, filename, filename stem, or a direct TOML path. PR selectors can be a PR id, ticket, branch, or GitHub PR number when present; `descendants` and `rebase-plan` also accept `stack-base`.
 
 ## Read Commands
 
@@ -34,8 +34,8 @@ python3 stack.py descendants ABC-123 ABC-124
 ```
 
 - `list`: stack id, title, repo, PR count, and tip branch.
-- `show <stack>`: PRs in stack order with tickets, branch, parent, base ref, and GitHub PR URL.
-- `find <query>`: search stack id, title, filename, PR id, ticket, branch, and GitHub PR number.
+- `show <stack>`: PRs in stack order with tickets, branch, parent, base ref, and GitHub PR URL when present.
+- `find <query>`: search stack id, title, filename, PR id, ticket, branch, and GitHub PR number when present.
 - `tip <stack>`: current stack tip.
 - `descendants <stack> <pr-or-branch>`: downstream PRs in stack order.
 
@@ -56,7 +56,7 @@ python3 stack.py validate ABC-123
 Validation checks:
 
 - schema version and required `[stack]`, `[repo]`, and `[[prs]]` fields
-- duplicate PR ids, branches, and GitHub PR numbers
+- duplicate PR ids, branches, and present GitHub PR numbers
 - parent references
 - `base_ref` values against stack base or known PR branches
 - event log JSONL shape
@@ -84,11 +84,10 @@ python3 stack.py add-to-stack ABC-123 \
   --title "Add todo list UI with create and toggle" \
   --ticket ABC-125 \
   --branch your-name/abc-125-todo-list-ui \
-  --github-pr 43 \
   --notes "Durable context only."
 ```
 
-By default, `add-to-stack` uses the current stack tip as parent and the tip branch as base ref. Use `--parent` and `--base-ref` only when adding a PR that is not based on the current tip.
+By default, `add-to-stack` uses the current stack tip as parent and the tip branch as base ref. Use `--parent` and `--base-ref` only when adding a PR that is not based on the current tip. Add `--github-pr` only when a GitHub PR already exists for the branch.
 
 Import or refresh a PR from GitHub:
 
@@ -97,6 +96,8 @@ python3 stack.py import-pr ABC-123 43
 ```
 
 `import-pr` uses `gh pr view` and the stack's `[repo].github`. It fails without editing if `gh` is unavailable, GitHub metadata is incomplete, or a new PR is not based on the current stack tip.
+
+If the branch already exists in the stack without `github_pr`, `import-pr` refreshes that entry with the GitHub PR number and metadata.
 
 Record an event without changing topology:
 

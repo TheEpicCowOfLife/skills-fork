@@ -21,6 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_STACKS_DIR = SCRIPT_DIR / "stacks"
 EVENT_KEYS = ("date", "kind", "summary", "pr_ids", "notes")
 PR_KEYS = ("id", "title", "tickets", "branch", "parent", "base_ref", "github_pr", "notes")
+PR_REQUIRED_KEYS = ("id", "title", "tickets", "branch", "parent", "base_ref", "notes")
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,7 @@ def main() -> int:
         help="ticket key; repeat for multi-ticket PRs",
     )
     add_to_stack.add_argument("--branch", required=True, help="new PR branch name")
-    add_to_stack.add_argument("--github-pr", required=True, type=int, help="GitHub PR number")
+    add_to_stack.add_argument("--github-pr", type=int, help="GitHub PR number; omit until a PR exists")
     add_to_stack.add_argument("--notes", default="", help="durable stack notes")
     add_to_stack.add_argument("--parent", help="parent PR id")
     add_to_stack.add_argument("--base-ref", help="base ref")
@@ -264,7 +265,8 @@ def tip_command(args: argparse.Namespace) -> str:
         output = {"stack": stack_file.data["stack"]["id"], "tip": None}
         return json_or_text(args, output, "")
     output = pr_output(stack_file, tip)
-    return json_or_text(args, output, f"{tip['id']}\t{tip['branch']}\t{github_pr_url(stack_file, tip)}")
+    text = "\t".join(filter(None, (tip["id"], tip["branch"], github_pr_url(stack_file, tip))))
+    return json_or_text(args, output, text)
 
 
 def validate_command(args: argparse.Namespace) -> str:
@@ -421,8 +423,9 @@ def find_matches(stacks_dir: Path, query: str) -> list[Match]:
                 "pr-id": pr["id"],
                 "title": pr["title"],
                 "branch": pr["branch"],
-                "github-pr": str(pr["github_pr"]),
             }
+            if pr.get("github_pr") is not None:
+                values["github-pr"] = str(pr["github_pr"])
             values.update({f"ticket:{ticket}": ticket for ticket in pr["tickets"]})
             for kind, value in values.items():
                 if query_lower in str(value).lower():
@@ -480,12 +483,20 @@ def validate_stack(stack_file: StackFile) -> list[str]:
     branch_by_id: dict[str, str] = {}
     for index, pr in enumerate(prs, start=1):
         label = f"prs[{index}]"
-        require_fields(issues, label, pr, PR_KEYS)
-        for key in ("id", "branch", "github_pr"):
+        require_fields(issues, label, pr, PR_REQUIRED_KEYS)
+        for key in ("id", "branch"):
             value = pr.get(key)
             if value in seen[key]:
                 issues.append(f"duplicate {key}: {value}")
             seen[key].add(value)
+        if "github_pr" in pr:
+            github_pr = pr.get("github_pr")
+            if not isinstance(github_pr, int):
+                issues.append(f"{label}.github_pr must be an integer")
+            elif github_pr in seen["github_pr"]:
+                issues.append(f"duplicate github_pr: {github_pr}")
+            else:
+                seen["github_pr"].add(github_pr)
         if isinstance(pr.get("tickets"), list) and all(isinstance(ticket, str) for ticket in pr["tickets"]):
             pass
         else:
@@ -539,7 +550,10 @@ def get_prs(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 def find_pr(data: dict[str, Any], target: str) -> dict[str, Any] | None:
     for pr in get_prs(data):
-        if target in {pr["id"], pr["branch"], str(pr["github_pr"])} or target in pr["tickets"]:
+        selectors = {pr["id"], pr["branch"], *pr["tickets"]}
+        if pr.get("github_pr") is not None:
+            selectors.add(str(pr["github_pr"]))
+        if target in selectors:
             return pr
     return None
 
@@ -598,7 +612,7 @@ def find_existing_import_target(data: dict[str, Any], pr_id: str | None, github_
     for pr in get_prs(data):
         if pr_id and pr["id"] == pr_id:
             return pr
-        if pr["github_pr"] == github_pr or pr["branch"] == branch:
+        if pr.get("github_pr") == github_pr or pr["branch"] == branch:
             return pr
     return None
 
@@ -644,12 +658,12 @@ def default_import_id(data: dict[str, Any], metadata: dict[str, Any]) -> str:
     return f"{data['stack']['id']}-{slugify(metadata['headRefName'])}"
 
 
-def ensure_new_pr(prs: list[dict[str, Any]], pr_id: str, branch: str, github_pr: int) -> None:
+def ensure_new_pr(prs: list[dict[str, Any]], pr_id: str, branch: str, github_pr: int | None) -> None:
     if any(pr.get("id") == pr_id for pr in prs):
         raise CliError(f"PR id already exists in stack: {pr_id}")
     if any(pr.get("branch") == branch for pr in prs):
         raise CliError(f"branch already exists in stack: {branch}")
-    if any(pr.get("github_pr") == github_pr for pr in prs):
+    if github_pr is not None and any(pr.get("github_pr") == github_pr for pr in prs):
         raise CliError(f"GitHub PR already exists in stack: {github_pr}")
 
 
@@ -660,19 +674,21 @@ def make_pr(
     branch: str,
     parent: str,
     base_ref: str,
-    github_pr: int,
+    github_pr: int | None,
     notes: str,
 ) -> dict[str, Any]:
-    return {
+    pr = {
         "id": pr_id,
         "title": title,
         "tickets": tickets,
         "branch": branch,
         "parent": parent,
         "base_ref": base_ref,
-        "github_pr": github_pr,
         "notes": notes,
     }
+    if github_pr is not None:
+        pr["github_pr"] = github_pr
+    return pr
 
 
 def default_pr_id(data: dict[str, Any], tickets: list[str], branch: str) -> str:
@@ -756,7 +772,7 @@ def pr_output(stack_file: StackFile, pr: dict[str, Any]) -> dict[str, Any]:
         "branch": pr["branch"],
         "parent": pr["parent"],
         "base_ref": pr["base_ref"],
-        "github_pr": pr["github_pr"],
+        "github_pr": pr.get("github_pr"),
         "github": github_pr_url(stack_file, pr),
         "notes": pr.get("notes", ""),
     }
@@ -785,7 +801,10 @@ def match_output(match: Match) -> dict[str, str]:
 
 
 def github_pr_url(stack_file: StackFile, pr: dict[str, Any]) -> str:
-    return f"https://github.com/{stack_file.data['repo']['github']}/pull/{pr['github_pr']}"
+    github_pr = pr.get("github_pr")
+    if github_pr is None:
+        return ""
+    return f"https://github.com/{stack_file.data['repo']['github']}/pull/{github_pr}"
 
 
 def append_note(current: str, addition: str) -> str:

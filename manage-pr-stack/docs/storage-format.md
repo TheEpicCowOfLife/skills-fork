@@ -28,7 +28,6 @@ tickets = ["ABC-124"]
 branch = "your-name/abc-124-todo-api"
 parent = "stack-base"
 base_ref = "main"
-github_pr = 42
 notes = "Durable handoff notes only."
 ```
 
@@ -48,7 +47,7 @@ See `examples/abc-123-todo-app-stack.toml` for a fuller two-PR stack.
 - `[[prs]].branch`: Git branch for the PR head.
 - `[[prs]].parent`: previous PR id, or `stack-base` for the bottom PR.
 - `[[prs]].base_ref`: current GitHub base ref for the PR. This can be the stack base or a PR branch. After a parent is merged, this may be retargeted to `main` while `parent` still records logical stack topology.
-- `[[prs]].github_pr`: GitHub PR number.
+- `[[prs]].github_pr`: optional GitHub PR number. Omit this until the branch has a real GitHub PR.
 - `[[prs]].notes`: durable handoff details, decisions, or context.
 
 Do not store CI state, reviewers, issue tracker status, merge commits, deleted branch state, workflow phase, sync state, or temporary plans in TOML.

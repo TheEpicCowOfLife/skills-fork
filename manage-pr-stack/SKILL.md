@@ -50,7 +50,7 @@ Use `stack.py` as the normal interface for reading and updating stack records. D
 
 ### Read Stack Context
 
-1. Use `show` for topology and PR URLs.
+1. Use `show` for topology and PR URLs when present.
 2. Use `tip` when deciding where a new PR should be based.
 3. Use `descendants` when a parent changed, merged, or needs rebasing.
 4. Use `validate` before acting on topology.
@@ -59,7 +59,7 @@ Use `stack.py` as the normal interface for reading and updating stack records. D
 ### Add Or Update A PR
 
 1. Prefer `import-pr` when a GitHub PR already exists and `gh` is available.
-2. Use `add-to-stack` when the user supplies the needed PR identity, branch, and PR number.
+2. Use `add-to-stack` when the user supplies the needed PR identity and branch. Include `--github-pr` only when a GitHub PR already exists.
 3. Use `--parent` and `--base-ref` only for non-tip insertion or explicit topology repairs.
 4. Validate after mutation.
 5. Do not add Jira status, reviewers, CI state, merge commits, branch deletion state, or workflow phase fields.
