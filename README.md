@@ -8,6 +8,7 @@ Some skills I've made for coding agents.
 | --- | --- |
 | [Field Guide Explainer](field-guide-explainer/) | Create self-contained HTML explainers with forest-green panels, editorial typography, annotated examples, and interactive diagrams. Includes a starter page, a design-system reference, and a complete IFC example. |
 | [Manage PR Stack](manage-pr-stack/) | Coordinate stacked pull requests across GitHub, Jira, and local Git using durable stack records, a Python CLI, and a rebase helper. |
+| [List PR Stacks](list-pr-stacks/) | List Manage PR Stack's stack records, most recently active first, as a Markdown table. Install it next to `manage-pr-stack`. |
 
 ## Usage
 
