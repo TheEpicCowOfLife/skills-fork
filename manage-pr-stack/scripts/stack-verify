@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""Run check commands on each head of a stack, one head at a time.
+
+Every head is checked out in one reused detached worktree with
+`git checkout --detach --force` and `git clean -fd`. Ignored files such as
+installed dependencies stay between heads. `--setup` runs before the commands
+when the blobs named by `--setup-inputs` differ from the last setup in this
+worktree, or on every head that runs when no inputs are given.
+
+A head whose tree, setup and commands all match an earlier passing run is not
+run again. Results and logs live under $XDG_CACHE_HOME/manage-pr-stack/verify,
+falling back to ~/.cache. Failed runs are never cached.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+TICKET_PATTERN = re.compile(r"[A-Z][A-Z0-9]+-\d+")
+MARKER = "stack-verify-worktree"
+SETUP_STATE = "stack-verify-setup.json"
+
+
+class StackVerifyError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Pr:
+    branch: str
+    pr_id: str
+    tickets: tuple[str, ...]
+    number: int | None
+
+
+@dataclass
+class HeadResult:
+    branch: str
+    tree: str
+    source: str
+    setup: str = "-"
+    exits: list[int | None] = field(default_factory=list)
+    seconds: float = 0.0
+    log: Path | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.setup != "failed" and all(code == 0 for code in self.exits)
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True)
+    if check and proc.returncode != 0:
+        raise StackVerifyError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc
+
+
+def find_oid(repo: Path, ref: str) -> str | None:
+    proc = git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    return proc.stdout.strip() or None
+
+
+def read_stack_record(stack: str, stacks_dir: str | None) -> dict:
+    command = [sys.executable, str(SKILL_DIR / "stack.py")]
+    if stacks_dir:
+        command += ["--stacks-dir", stacks_dir]
+    proc = subprocess.run([*command, "--json", "show", stack], text=True, capture_output=True)
+    if proc.returncode != 0:
+        raise StackVerifyError(f"stack.py show {stack} failed: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def split_list(values: list[str]) -> list[str]:
+    return [item.strip() for value in values for item in value.split(",") if item.strip()]
+
+
+def pr_matches(pr: Pr, selector: str) -> bool:
+    number = selector.lstrip("#")
+    return selector in (pr.branch, pr.pr_id, *pr.tickets) or (pr.number is not None and number == str(pr.number))
+
+
+def select_pr(prs: list[Pr], selector: str) -> int:
+    matches = [index for index, pr in enumerate(prs) if pr_matches(pr, selector)]
+    if len(matches) != 1:
+        found = "no PR" if not matches else f"{len(matches)} PRs"
+        raise StackVerifyError(f"{selector!r} matched {found}; use a branch, PR id, or PR number")
+    return matches[0]
+
+
+def load_prs(args: argparse.Namespace) -> list[Pr]:
+    if args.branches:
+        return [
+            Pr(branch=branch, pr_id=branch, tickets=tuple(TICKET_PATTERN.findall(branch)), number=None)
+            for branch in split_list(args.branches)
+        ]
+    if not args.stack:
+        raise StackVerifyError("pass --stack or --branches")
+    record = read_stack_record(args.stack, args.stacks_dir)
+    prs = [
+        Pr(
+            branch=pr["branch"],
+            pr_id=pr["id"],
+            tickets=tuple(ticket for ticket in pr["tickets"].split(",") if ticket),
+            number=pr["github_pr"],
+        )
+        for pr in record["prs"]
+    ]
+    if args.from_pr:
+        prs = prs[select_pr(prs, args.from_pr) :]
+    return prs
+
+
+def cache_root() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "manage-pr-stack" / "verify"
+
+
+def cache_entry(tree: str, setup: str | None, commands: list[str]) -> Path:
+    key = hashlib.sha256(json.dumps({"tree": tree, "setup": setup, "commands": commands}).encode()).hexdigest()
+    return cache_root() / key[:2] / key
+
+
+def absolute_git_dirs(path: Path) -> tuple[Path, Path]:
+    output = git(path, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").stdout.split("\n")
+    return Path(output[0]).resolve(), Path(output[1]).resolve()
+
+
+def open_worktree(repo: Path, path: Path, first_commit: str) -> Path:
+    """Return the worktree's private git dir, creating the worktree if needed."""
+    _, repo_common = absolute_git_dirs(repo)
+    if not path.exists():
+        git(repo, "worktree", "add", "--quiet", "--detach", str(path), first_commit)
+        git_dir, _ = absolute_git_dirs(path)
+        (git_dir / MARKER).touch()
+        return git_dir
+    proc = git(path, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", check=False)
+    if proc.returncode == 0:
+        git_dir, common = absolute_git_dirs(path)
+        if common == repo_common and (git_dir / MARKER).exists():
+            return git_dir
+    # checkout --force and clean -fd would destroy work in any other directory.
+    raise StackVerifyError(f"{path} exists and is not a stack-verify worktree of {repo}; pass another --worktree")
+
+
+def lock_worktree(git_dir: Path):
+    handle = (git_dir / "stack-verify.lock").open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise StackVerifyError(f"another stack-verify is using the worktree for {git_dir}") from exc
+    return handle
+
+
+def setup_inputs(worktree: Path, commit: str, paths: list[str]) -> dict[str, str]:
+    if not paths:
+        return {}
+    listing = git(worktree, "ls-tree", "-r", commit, "--", *paths).stdout
+    return {line.split("\t", 1)[1]: line.split()[2] for line in listing.splitlines()}
+
+
+def run_logged(command: str, cwd: Path, log, label: str) -> tuple[int, float]:
+    log.write(f"$ {command}    # {label}\n")
+    log.flush()
+    started = time.monotonic()
+    proc = subprocess.run(["bash", "-c", command], cwd=cwd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+    elapsed = time.monotonic() - started
+    log.write(f"# exit {proc.returncode} after {elapsed:.1f}s\n\n")
+    log.flush()
+    return proc.returncode, elapsed
+
+
+def verify_head(
+    worktree: Path, git_dir: Path, branch: str, commit: str, tree: str, args: argparse.Namespace, entry: Path
+) -> HeadResult:
+    result = HeadResult(branch=branch, tree=tree, source="ran", log=entry / "output.log")
+    started = time.monotonic()
+    git(worktree, "checkout", "--quiet", "--detach", "--force", commit)
+    git(worktree, "clean", "--quiet", "-fd")
+    entry.mkdir(parents=True, exist_ok=True)
+    (entry / "result.json").unlink(missing_ok=True)
+    with result.log.open("w") as log:
+        log.write(f"# {branch} {commit} tree {tree}\n\n")
+        if args.setup:
+            state_path = git_dir / SETUP_STATE
+            wanted = {"command": args.setup, "inputs": setup_inputs(worktree, commit, args.setup_inputs)}
+            previous = json.loads(state_path.read_text()) if state_path.exists() else None
+            if args.setup_inputs and previous == wanted:
+                result.setup = "skip"
+            else:
+                state_path.unlink(missing_ok=True)
+                code, _ = run_logged(args.setup, worktree, log, "setup")
+                result.setup = "ran" if code == 0 else "failed"
+                if code == 0:
+                    state_path.write_text(json.dumps(wanted))
+        if result.setup == "failed":
+            result.exits = [None] * len(args.cmd)
+        else:
+            for index, command in enumerate(args.cmd, start=1):
+                code, _ = run_logged(command, worktree, log, f"[{index}]")
+                result.exits.append(code)
+    result.seconds = time.monotonic() - started
+    if result.passed:
+        (entry / "result.json").write_text(
+            json.dumps({"branch": branch, "commit": commit, "exits": result.exits, "seconds": result.seconds})
+        )
+    return result
+
+
+def format_table(results: list[HeadResult], commands: list[str], has_setup: bool) -> str:
+    columns = ["head", "tree", "result"]
+    if has_setup:
+        columns.append("setup")
+    columns += [f"[{index}]" for index in range(1, len(commands) + 1)] + ["time"]
+    rows = []
+    for item in results:
+        row = {"head": item.branch, "tree": item.tree[:7], "result": item.source, "setup": item.setup, "time": f"{item.seconds:.1f}s"}
+        for index, code in enumerate(item.exits, start=1):
+            row[f"[{index}]"] = "-" if code is None else str(code)
+        rows.append(row)
+    widths = {column: max(len(column), *(len(row.get(column, "")) for row in rows)) for column in columns}
+    lines = ["  ".join(column.ljust(widths[column]) for column in columns).rstrip()]
+    lines.append("  ".join("-" * widths[column] for column in columns))
+    lines += ["  ".join(row.get(column, "").ljust(widths[column]) for column in columns).rstrip() for row in rows]
+    lines.append("")
+    lines += [f"[{index}] {command}" for index, command in enumerate(commands, start=1)]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run commands on each stack head in one reused worktree, with a cache.")
+    parser.add_argument("--repo", default=".", help="git repository path")
+    parser.add_argument("--stack", help="stack selector, read through stack.py")
+    parser.add_argument("--stacks-dir", help="stack.py --stacks-dir")
+    parser.add_argument("--from", dest="from_pr", help="start at this PR instead of the bottom of the stack")
+    parser.add_argument(
+        "--branches", action="append", default=[], help="branches bottom first, comma-separated or repeated; replaces --stack"
+    )
+    parser.add_argument("--ref-prefix", default="refs/heads/", help="prefix that turns a branch into a ref, default: refs/heads/")
+    parser.add_argument("--cmd", action="append", default=[], help="command to run in the worktree; repeatable, runs in order")
+    parser.add_argument("--setup", help="command to run before the commands when the setup inputs change, e.g. a dependency install")
+    parser.add_argument(
+        "--setup-inputs", action="append", default=[], help="paths whose blobs decide whether --setup runs again; comma-separated or repeated"
+    )
+    parser.add_argument("--worktree", help="worktree path, default: <repo>.stack-verify next to the repository")
+    parser.add_argument("--no-cache", action="store_true", help="run every head even if a passing result is cached")
+    parser.add_argument("--remove-worktree", action="store_true", help="remove the worktree and exit")
+    args = parser.parse_args()
+    args.setup_inputs = split_list(args.setup_inputs)
+
+    try:
+        repo = Path(git(Path(args.repo).expanduser().resolve(), "rev-parse", "--show-toplevel").stdout.strip())
+        worktree = Path(args.worktree).expanduser().resolve() if args.worktree else repo.with_name(f"{repo.name}.stack-verify")
+        if args.remove_worktree:
+            if not worktree.exists():
+                print(f"no worktree at {worktree}")
+                return 0
+            open_worktree(repo, worktree, "HEAD")
+            git(repo, "worktree", "remove", "--force", str(worktree))
+            print(f"removed {worktree}")
+            return 0
+        if not args.cmd:
+            parser.error("pass at least one --cmd")
+        prs = load_prs(args)
+        if not prs:
+            raise StackVerifyError("no PRs selected")
+        heads = []
+        for pr in prs:
+            commit = find_oid(repo, f"{args.ref_prefix}{pr.branch}") or find_oid(repo, pr.branch)
+            if commit is None:
+                raise StackVerifyError(f"{args.ref_prefix}{pr.branch} does not exist")
+            heads.append((pr.branch, commit, git(repo, "rev-parse", f"{commit}^{{tree}}").stdout.strip()))
+
+        git_dir = open_worktree(repo, worktree, heads[0][1])
+        lock = lock_worktree(git_dir)
+        print(f"worktree {worktree}, cache {cache_root()}", file=sys.stderr)
+        results = []
+        for position, (branch, commit, tree) in enumerate(heads, start=1):
+            entry = cache_entry(tree, args.setup, args.cmd)
+            cached = entry / "result.json"
+            if cached.exists() and not args.no_cache:
+                stored = json.loads(cached.read_text())
+                result = HeadResult(branch=branch, tree=tree, source="cached", exits=stored["exits"], log=entry / "output.log")
+            else:
+                print(f"[{position}/{len(heads)}] {branch} {commit[:7]}", file=sys.stderr)
+                result = verify_head(worktree, git_dir, branch, commit, tree, args, entry)
+            results.append(result)
+        lock.close()
+
+        print(format_table(results, args.cmd, bool(args.setup)))
+        failed = [item for item in results if not item.passed]
+        if failed:
+            print(f"\n{len(failed)} of {len(results)} head(s) failed. Logs:")
+            for item in failed:
+                print(f"  {item.branch}: {item.log}")
+            return 1
+        print(f"\nAll {len(results)} head(s) passed.")
+        return 0
+    except StackVerifyError as exc:
+        print(f"stack-verify: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

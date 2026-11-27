@@ -206,3 +206,35 @@ c       d6e7c9d  4ba9669  1  0  1  0  1 new
 e       7e218ca  8e30a4c  1  0  0  0  unchanged    moved from d onto c
 d       ea12e39  a3ee118  1  0  0  0  unchanged    moved from c onto e
 ```
+
+## Verify Every Head
+
+`scripts/stack-verify` runs check commands on each head of the stack, one head at a time:
+
+```bash
+./scripts/stack-verify --repo /tmp/wave/todo-app --stack ABC-123 \
+  --setup "bun install --frozen-lockfile" --setup-inputs bun.lock,package.json \
+  --cmd "bun run check" --cmd "bun run typecheck" --cmd "bun test"
+```
+
+- Heads are `refs/heads/<branch>` for the stack record's branches, from `--from <pr>` up when given. `--branches` takes an explicit list instead, and `--ref-prefix` points at other refs, such as `refs/remotes/origin/`.
+- All heads share one detached worktree, `--worktree`, which defaults to `<repo>.stack-verify` next to the repository. Between heads the script runs `git checkout --detach --force <head>` and `git clean -fd`. Without `-x`, ignored files such as installed dependencies stay. It refuses to use a directory it did not create, and `--remove-worktree` deletes the worktree.
+- `--setup` runs before the commands when the blobs at `--setup-inputs` differ from the last successful setup in this worktree. With no inputs it runs on every head that runs.
+- A head is skipped when an earlier run with the same tree, setup command and command list passed, so a head whose tree survived a rebase or reorder is not checked again. The cache lives in `$XDG_CACHE_HOME/manage-pr-stack/verify`, or `~/.cache/manage-pr-stack/verify`. Failed runs are not cached, and `--no-cache` runs every head. Environment variables are not part of the key, so put them in the command, as in `env -u CONVERTER_BIN bun test`.
+- Each head's output goes to one log in its cache entry. The script prints the log paths of failed heads and exits 1 if any head failed.
+- It runs commands sequentially on purpose. Parallel typechecks can run a machine out of memory.
+
+Example, after a change to `b` only:
+
+```text
+head  tree     result  setup  [1]  [2]  time
+----  -------  ------  -----  ---  ---  ----
+a     99464c1  cached  -      0    0    0.0s
+b     1f30fd8  ran     ran    0    0    4.2s
+c     f3cd415  cached  -      0    0    0.0s
+
+[1] bun run check
+[2] bun test
+
+All 3 head(s) passed.
+```
