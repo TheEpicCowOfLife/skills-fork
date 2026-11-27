@@ -131,6 +131,10 @@ def main() -> int:
     record_event.add_argument("--pr", action="append", dest="prs", default=[], help="PR target")
     record_event.add_argument("--notes", default="", help="event notes")
 
+    events = subparsers.add_parser("events", help="show a stack's events, oldest first")
+    events.add_argument("stack", help="stack id, filename stem, or path")
+    events.add_argument("--kind", action="append", dest="kinds", default=[], help="only events of this kind; repeatable")
+
     import_pr = subparsers.add_parser("import-pr", help="import one GitHub PR")
     import_pr.add_argument("stack", help="stack id, filename stem, or path")
     import_pr.add_argument("github_pr", type=int, help="GitHub PR number")
@@ -175,6 +179,8 @@ def dispatch(args: argparse.Namespace) -> str | None:
         return mark_merged_command(args)
     if args.command == "record-event":
         return record_event_command(args)
+    if args.command == "events":
+        return events_command(args)
     if args.command == "import-pr":
         return import_pr_command(args)
     raise CliError(f"unknown command: {args.command}")
@@ -344,6 +350,18 @@ def record_event_command(args: argparse.Namespace) -> str:
     }
     append_event(stack_file.path, event)
     return json_or_text(args, event, f"recorded {args.kind} event for {stack_file.data['stack']['id']}")
+
+
+def events_command(args: argparse.Namespace) -> str:
+    stack_file = resolve_stack(args.stacks_dir, args.stack)
+    events = [event for event in read_events(stack_file.path) if not args.kinds or event.get("kind") in args.kinds]
+    if args.json_output:
+        return to_json(events)
+    rows = [
+        {"date": event["date"], "kind": event["kind"], "prs": ",".join(event["pr_ids"]), "summary": event["summary"]}
+        for event in events
+    ]
+    return format_rows(rows, ("date", "kind", "prs", "summary"))
 
 
 def import_pr_command(args: argparse.Namespace) -> str:

@@ -72,6 +72,16 @@ Use `record-event` for ordinary event updates instead of hand-editing JSONL.
 
 See `examples/abc-123-todo-app-stack.events.jsonl` and `examples/abc-200-todo-due-dates-stack.events.jsonl` for sample event history.
 
+### Wave Claims
+
+Event kinds are free text. Three of them coordinate restack waves between sessions:
+
+- `claim`: a session is about to rebuild branches of the stack. The summary names who holds the claim, such as a session id or the path of the wave clone, and `pr_ids` lists the PRs in scope. `date` has no time of day, so put the start time in `notes`.
+- `push`: work on the stack was pushed. It releases any earlier claim.
+- `abandon`: a claimed wave was dropped without a push. It releases the claim.
+
+A claim is open while it is the last of the `claim`, `push` and `abandon` events. `stack.py events <stack> --kind claim --kind push --kind abandon` lists them.
+
 ## Direct Editing
 
 Use direct edits only when the CLI cannot express the required repair.

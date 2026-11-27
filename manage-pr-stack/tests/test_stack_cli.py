@@ -188,6 +188,47 @@ class StackCliTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("GitHub PR already exists in stack: 42", result.stderr)
 
+    def test_events_lists_the_log_and_filters_by_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stacks_dir = Path(tmp)
+            self.create_stack(stacks_dir)
+            self.run_ok(
+                stacks_dir,
+                "add-to-stack",
+                "ABC-123",
+                "--title",
+                "Add todo API",
+                "--ticket",
+                "ABC-124",
+                "--branch",
+                "user/abc-124-todo-api",
+            )
+            self.run_ok(
+                stacks_dir,
+                "record-event",
+                "ABC-123",
+                "--kind",
+                "claim",
+                "--summary",
+                "Session 1 claims a restack wave over ABC-124.",
+                "--pr",
+                "ABC-124",
+                "--notes",
+                "Wave clone /tmp/wave/todo-app, started 09:30.",
+            )
+            self.run_ok(stacks_dir, "record-event", "ABC-123", "--kind", "push", "--summary", "Pushed the wave.")
+
+            everything = self.run_ok(stacks_dir, "events", "ABC-123").stdout.splitlines()
+            self.assertEqual([line.split()[1] for line in everything[2:]], ["add-pr", "claim", "push"])
+
+            claims = json.loads(self.run_ok(stacks_dir, "--json", "events", "ABC-123", "--kind", "claim").stdout)
+            self.assertEqual(len(claims), 1)
+            self.assertEqual(claims[0]["pr_ids"], ["ABC-124"])
+            self.assertEqual(claims[0]["notes"], "Wave clone /tmp/wave/todo-app, started 09:30.")
+
+            wave_events = self.run_ok(stacks_dir, "events", "ABC-123", "--kind", "claim", "--kind", "push").stdout
+            self.assertEqual([line.split()[1] for line in wave_events.splitlines()[2:]], ["claim", "push"])
+
 
 if __name__ == "__main__":
     unittest.main()

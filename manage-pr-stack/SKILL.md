@@ -15,7 +15,7 @@ Use `stack.py` as the normal interface for reading and updating stack records. D
 
 ## Package Files
 
-- `stack.py`: CLI for stack discovery, inspection, validation, topology updates, event logging, and GitHub PR import.
+- `stack.py`: CLI for stack discovery, inspection, validation, topology updates, event logging and reading, and GitHub PR import.
 - `docs/storage-format.md`: TOML stack and JSONL event-log format reference.
 - `docs/cli-reference.md`: command reference and examples for `stack.py`.
 - `stacks/*.toml`: ignored local stack records for real current work.
@@ -39,6 +39,7 @@ Use `stack.py` as the normal interface for reading and updating stack records. D
 - A direct command such as "I've just pushed a minor adjustment to del-1876; update the PR stack" means propagate the parent branch change through descendants: fetch, identify descendants, rebase in order, resolve straightforward conflicts, force-push rebased descendants, and record what changed.
 - Treat "update the PR stack" as an operational request to make the stack current. Treat "update the stack record", "update the stack file", or "record this" as a record-only request.
 - Stop and ask before continuing if a rebase conflict is non-trivial, the worktree is dirty with unrelated changes, observed branch topology differs from the stack record, the operation would affect branches outside the requested stack, or the command's intent is ambiguous.
+- Before rebuilding several branches of a stack at once (a restack wave), run `python3 stack.py events <stack> --kind claim --kind push --kind abandon`. If the last of these is a `claim`, another session is building a wave: coordinate with whoever its summary names before you build. Otherwise record your own claim first with `record-event --kind claim`, naming yourself and the PRs in scope. Release it with a `push` event once the wave is pushed, or an `abandon` event if you drop it.
 - Do not transition Jira, request reviewers, change GitHub PR bases, merge PRs, or post Slack messages unless the user explicitly requests that external write.
 - Use the existing workflow skills for phase-specific work: `implement-ticket`, `raise-my-pr`, `review-pr-feedback`, and `prepare-review-request`.
 

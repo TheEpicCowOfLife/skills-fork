@@ -31,6 +31,7 @@ python3 stack.py show ABC-123
 python3 stack.py find ABC-124
 python3 stack.py tip ABC-123
 python3 stack.py descendants ABC-123 ABC-124
+python3 stack.py events ABC-123 --kind claim --kind push --kind abandon
 ```
 
 - `list`: stack id, title, repo, PR count, and tip branch.
@@ -38,6 +39,7 @@ python3 stack.py descendants ABC-123 ABC-124
 - `find <query>`: search stack id, title, filename, PR id, ticket, branch, and GitHub PR number when present.
 - `tip <stack>`: current stack tip.
 - `descendants <stack> <pr-or-branch>`: downstream PRs in stack order.
+- `events <stack>`: the event log, oldest first, with date, kind, PR ids, and summary. `--kind` keeps only that kind and can repeat. `--json` also gives each event's notes.
 
 Use `--json` for automation:
 
@@ -108,6 +110,18 @@ python3 stack.py record-event ABC-123 \
   --pr ABC-124 \
   --notes "No topology changes."
 ```
+
+Claim the stack before a restack wave, so another session does not build an overlapping one:
+
+```bash
+python3 stack.py record-event ABC-123 \
+  --kind claim \
+  --summary "Session 4f1c claims a restack wave over ABC-124 and ABC-125." \
+  --pr ABC-124 --pr ABC-125 \
+  --notes "Wave clone /tmp/wave/todo-app, started 09:30."
+```
+
+Record `--kind push` after the wave is pushed, or `--kind abandon` if it is dropped. Either releases the claim. See `docs/storage-format.md`.
 
 Mark a PR as merged in the stack record:
 
