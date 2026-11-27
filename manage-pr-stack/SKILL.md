@@ -25,6 +25,7 @@ Use `stack.py` as the normal interface for reading and updating stack records. D
 - `scripts/stack-rebase`: helper for dry-running, rebasing, and force-pushing linear PR stack branches with explicit `--onto` boundaries and `--force-with-lease`. Its preflight refuses a boundary that would replay commits already in the new parent.
 - `scripts/stack-range-diff`: runs `git range-diff` for every PR between old heads (`origin/*` or a backup ref prefix) and new local heads, and labels each PR unchanged, rewritten, gaining commits or losing commits. It finds each PR's parent from ancestry, so reorders need no extra input. `--markdown` prints a summary to send to a reviewer.
 - `scripts/stack-verify`: runs check commands on each stack head in turn, in one reused detached worktree. It caches passing results by tree and command list, re-runs a setup command only when its input files change, keeps a log per head, and exits non-zero on any failure.
+- `scripts/stack-push`: writes a bash script that pushes rebuilt stack branches in one `git push --atomic` with a `--force-with-lease` per branch, changes PR bases with `gh api` before or after the push so GitHub never sees a PR's head inside its base, and reads every head and base back. It pushes nothing itself; the user runs the script.
 - `tests/`: unittests for the CLI and the scripts; run `python3 -m unittest discover -s tests` from the skill directory after changing `stack.py` or anything in `scripts/`.
 
 ## Core Rules

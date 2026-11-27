@@ -238,3 +238,40 @@ c     f3cd415  cached  -      0    0    0.0s
 
 All 3 head(s) passed.
 ```
+
+## Push A Rebuilt Stack
+
+`scripts/stack-push` writes a bash script that force-pushes rebuilt branches and fixes PR bases. Agents should not force-push, so the script is the hand-off: the user reads it and runs it.
+
+```bash
+./scripts/stack-push --repo /tmp/wave/todo-app --stack ABC-123 --output /tmp/wave/push.sh
+./scripts/stack-push --repo /tmp/wave/todo-app --branches feature-one,feature-three,feature-two \
+  --slug example-org/todo-app --sync-workspace /Users/you/code/todo-app --output /tmp/wave/push.sh
+```
+
+- New heads are the local branches in `--repo`. Old heads are `<remote>/<branch>` in the same repository, and they become the leases, so fetch before generating the script and generate it again after any rebuild.
+- Each PR's new base is the branch below it in the given order. The bottom PR keeps its current base unless `--base` names a new one. PR numbers and current bases come from `gh pr list`, and the slug comes from the stack record or `--slug`.
+- The script runs with `set -euo pipefail`. It changes the bases that must change before the push, pushes every changed branch in one `git push --atomic` with a `--force-with-lease=refs/heads/<branch>:<old-oid>` each, changes the remaining bases, then reads back every head with `git ls-remote` and every base with `gh api`, printing `OK` or each mismatch. A failed push stops the script and prints how to undo the base changes it already made.
+- Base changes use `gh api -X PATCH repos/<slug>/pulls/<n> -f base=<branch>`. `gh pr edit` has failed silently on base changes in some repositories.
+- `--sync-workspace <path>` adds a last step. After the read-back, each pushed branch in that checkout moves to its new head if it still points at its old head: with `git reset --keep` in a clean worktree that has it checked out, or `git branch --force` when no worktree has it. Anything else is reported and skipped.
+
+GitHub marks a PR merged when its base branch's head contains the PR's head. For each base change the script generator picks a moment:
+
+- Before the push is safe only if the new base's old head does not contain the PR's old head.
+- After the push is safe only if the old base's new head does not contain the PR's new head, because that is the state between the push and the base change.
+- In both cases the new base's new head must not contain the PR's new head. PRs whose base does not change get the same final check.
+
+It prefers after the push, so a failed push leaves that base untouched. If neither moment is safe it refuses and explains why. Moving a PR from the top of a stack to just above a lower PR is the usual case: that PR's base must change before the push, and the PR that used to sit on the lower PR must change after it. Reversing three PRs is a case with no safe order for the middle PR; move its base in two steps by hand, through a branch that contains neither head.
+
+A PR in a GitHub native stack refuses base changes. The generator reads the `stack` field of `gh api repos/<slug>/pulls/<n>` for each PR whose base changes, and refuses with a pointer to unstack it on GitHub first. A stacked PR has a `stack` object such as `{"id": 4174155, "number": 6143, "position": 3, "size": 3, "base": {...}}`. Other PRs have no `stack` field, and the generator treats `null` the same way. It never calls the `/stacks` endpoints, because a POST there dissolves the stack.
+
+Example summary:
+
+```text
+branch  pr  old      new      push  base
+------  --  -------  -------  ----  --------------------
+a       #1  61e7e99  61e7e99  no    main (unchanged)
+d       #4  bf378fe  2ec2cf6  yes   c -> a (before push)
+b       #2  9be55cb  4a5d411  yes   a -> d (after push)
+c       #3  c5f24b7  eae40a4  yes   b (unchanged)
+```

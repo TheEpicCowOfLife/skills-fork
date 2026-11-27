@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Write a bash script that force-pushes a rebuilt stack and fixes its PR bases.
+
+This script pushes nothing itself. The generated script is the hand-off for the
+user to read and run. It
+
+1. changes the PR bases that must change before the push,
+2. pushes every changed branch in one `git push --atomic`, with a
+   `--force-with-lease` on the origin head seen when the script was generated,
+3. changes the remaining PR bases,
+4. reads back each branch head with `git ls-remote` and each PR base with
+   `gh api`, and prints OK or each mismatch,
+5. with --sync-workspace, moves the user's local branches to the new heads.
+
+New heads are local branches. Old heads, which are also the leases, are
+`<remote>/<branch>`. A PR's new base is the branch below it in the given
+order; the bottom PR keeps its current base unless --base is given.
+
+GitHub marks a PR merged when its base branch's head contains the PR's head.
+A base change is safe before the push only if the new base's old head does not
+contain the PR's old head, and safe after the push only if the old base's new
+head does not contain the PR's new head. The new base's new head must never
+contain the PR's new head. When both orders are safe the change goes after the
+push, so a failed push leaves that base alone.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+TICKET_PATTERN = re.compile(r"[A-Z][A-Z0-9]+-\d+")
+
+
+class StackPushError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Pr:
+    branch: str
+    pr_id: str
+    tickets: tuple[str, ...]
+    number: int | None
+
+
+@dataclass
+class Branch:
+    name: str
+    old: str | None
+    new: str
+    number: int | None = None
+    current_base: str | None = None
+    new_base: str | None = None
+    timing: str = ""
+
+    @property
+    def pushed(self) -> bool:
+        return self.old != self.new
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True)
+    if check and proc.returncode != 0:
+        raise StackPushError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc
+
+
+def find_oid(repo: Path, ref: str) -> str | None:
+    proc = git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    return proc.stdout.strip() or None
+
+
+def contains(repo: Path, base_head: str | None, pr_head: str | None) -> bool:
+    if base_head is None or pr_head is None:
+        return False
+    return git(repo, "merge-base", "--is-ancestor", pr_head, base_head, check=False).returncode == 0
+
+
+def gh_json(*args: str):
+    try:
+        proc = subprocess.run(["gh", *args], text=True, capture_output=True)
+    except FileNotFoundError as exc:
+        raise StackPushError("gh CLI is not available") from exc
+    if proc.returncode != 0:
+        raise StackPushError(f"gh {' '.join(args)} failed: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def read_stack_record(stack: str, stacks_dir: str | None) -> dict:
+    command = [sys.executable, str(SKILL_DIR / "stack.py")]
+    if stacks_dir:
+        command += ["--stacks-dir", stacks_dir]
+    proc = subprocess.run([*command, "--json", "show", stack], text=True, capture_output=True)
+    if proc.returncode != 0:
+        raise StackPushError(f"stack.py show {stack} failed: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def split_list(values: list[str]) -> list[str]:
+    return [item.strip() for value in values for item in value.split(",") if item.strip()]
+
+
+def pr_matches(pr: Pr, selector: str) -> bool:
+    number = selector.lstrip("#")
+    return selector in (pr.branch, pr.pr_id, *pr.tickets) or (pr.number is not None and number == str(pr.number))
+
+
+def select_pr(prs: list[Pr], selector: str) -> int:
+    matches = [index for index, pr in enumerate(prs) if pr_matches(pr, selector)]
+    if len(matches) != 1:
+        found = "no PR" if not matches else f"{len(matches)} PRs"
+        raise StackPushError(f"{selector!r} matched {found}; use a branch, PR id, or PR number")
+    return matches[0]
+
+
+def load_prs(args: argparse.Namespace) -> tuple[list[Pr], str | None]:
+    """Return the selected PRs and the stack record's GitHub slug, if a record was read."""
+    if args.branches:
+        prs = [
+            Pr(branch=branch, pr_id=branch, tickets=tuple(TICKET_PATTERN.findall(branch)), number=None)
+            for branch in split_list(args.branches)
+        ]
+        return prs, None
+    if not args.stack:
+        raise StackPushError("pass --stack or --branches")
+    record = read_stack_record(args.stack, args.stacks_dir)
+    prs = [
+        Pr(
+            branch=pr["branch"],
+            pr_id=pr["id"],
+            tickets=tuple(ticket for ticket in pr["tickets"].split(",") if ticket),
+            number=pr["github_pr"],
+        )
+        for pr in record["prs"]
+    ]
+    if args.from_pr:
+        prs = prs[select_pr(prs, args.from_pr) :]
+    return prs, record["stack"]["repo"]
+
+
+def plan_branches(repo: Path, remote: str, slug: str, prs: list[Pr], bottom_base: str | None) -> list[Branch]:
+    branches = []
+    for pr in prs:
+        new = find_oid(repo, f"refs/heads/{pr.branch}")
+        if new is None:
+            raise StackPushError(f"local branch {pr.branch} does not exist")
+        branches.append(Branch(name=pr.branch, old=find_oid(repo, f"refs/remotes/{remote}/{pr.branch}"), new=new))
+
+    open_prs = gh_json("pr", "list", "--repo", slug, "--state", "open", "--limit", "1000", "--json", "number,headRefName,baseRefName")
+    by_head = {item["headRefName"]: item for item in open_prs}
+    for index, branch in enumerate(branches):
+        found = by_head.get(branch.name)
+        if found is None:
+            continue
+        branch.number = found["number"]
+        branch.current_base = found["baseRefName"]
+        if index > 0:
+            branch.new_base = branches[index - 1].name
+        else:
+            branch.new_base = bottom_base or branch.current_base
+    return branches
+
+
+def check_order(repo: Path, remote: str, slug: str, branches: list[Branch]) -> list[str]:
+    """Set each branch's timing and return the reasons to refuse, if any."""
+    by_name = {branch.name: branch for branch in branches}
+
+    def old_head(name: str) -> str | None:
+        return by_name[name].old if name in by_name else find_oid(repo, f"refs/remotes/{remote}/{name}")
+
+    def new_head(name: str) -> str | None:
+        return by_name[name].new if name in by_name else find_oid(repo, f"refs/remotes/{remote}/{name}")
+
+    refusals = []
+    for branch in branches:
+        if branch.number is None:
+            continue
+        label = f"#{branch.number} ({branch.name})"
+        if branch.old is None:
+            refusals.append(f"{label}: {remote}/{branch.name} is missing here, so there is no lease; fetch first")
+            continue
+        if new_head(branch.new_base) is None:
+            refusals.append(f"{label}: new base {branch.new_base} is not on {remote} and not a local branch being pushed")
+            continue
+        if contains(repo, new_head(branch.new_base), branch.new):
+            refusals.append(
+                f"{label}: {branch.new_base}'s new head contains this PR's new head, so GitHub would mark it merged"
+            )
+            continue
+        if branch.new_base == branch.current_base:
+            continue
+
+        stack = gh_json("api", f"repos/{slug}/pulls/{branch.number}").get("stack")
+        if stack:
+            refusals.append(
+                f"{label}: the PR is part of a GitHub stack, which refuses base changes. "
+                "Unstack it on GitHub first, then generate the script again"
+            )
+            continue
+        before_ok = old_head(branch.new_base) is not None and not contains(repo, old_head(branch.new_base), branch.old)
+        after_ok = not contains(repo, new_head(branch.current_base), branch.new)
+        if after_ok:
+            branch.timing = "after"
+        elif before_ok:
+            branch.timing = "before"
+        else:
+            refusals.append(
+                f"{label}: base {branch.current_base} -> {branch.new_base} is unsafe on both sides of the push. "
+                f"Before it, {branch.new_base}'s old head contains this PR's old head; after it, "
+                f"{branch.current_base}'s new head contains this PR's new head. Either moment would mark the PR merged. "
+                f"Move the base in two steps instead: to a branch that contains neither head before the push, "
+                f"then to {branch.new_base} after it"
+            )
+    return refusals
+
+
+def render_script(
+    repo: Path, remote: str, slug: str, branches: list[Branch], sync_workspace: Path | None
+) -> str:
+    q = shlex.quote
+    pushed = [branch for branch in branches if branch.pushed]
+    before = [branch for branch in branches if branch.timing == "before"]
+    after = [branch for branch in branches if branch.timing == "after"]
+    lines = [
+        "#!/usr/bin/env bash",
+        f"# Generated by stack-push at {datetime.now().astimezone().isoformat(timespec='seconds')} for {slug}.",
+        f"# Pushes {len(pushed)} branch(es) from {repo} and changes {len(before) + len(after)} PR base(s).",
+        f"# The leases are the {remote} heads seen when it was generated. Generate it again after any rebuild.",
+        "set -euo pipefail",
+        "",
+        f"repo={q(str(repo))}",
+        f"remote={q(remote)}",
+        f"slug={q(slug)}",
+        "",
+        "patch_base() {",
+        '  echo "#$1: base -> $2"',
+        '  gh api -X PATCH "repos/$slug/pulls/$1" -f "base=$2" --silent',
+        "}",
+        "",
+    ]
+    if before:
+        lines.append('echo "== Base changes before the push"')
+        lines += [f"patch_base {branch.number} {q(branch.new_base)}" for branch in before]
+        lines.append("")
+    if pushed:
+        lines.append('echo "== Push"')
+        leases = [q(f"--force-with-lease=refs/heads/{branch.name}:{branch.old or ''}") for branch in pushed]
+        refspecs = [q(f"{branch.new}:refs/heads/{branch.name}") for branch in pushed]
+        lines.append('if ! git -C "$repo" push --atomic \\')
+        lines += [f"  {lease} \\" for lease in leases]
+        lines.append('  "$remote" \\')
+        lines += [f"  {refspec} \\" for refspec in refspecs]
+        lines[-1] = lines[-1].removesuffix(" \\") + "; then"
+        lines.append('  echo "The push failed, so nothing changed on $remote." >&2')
+        if before:
+            lines.append('  echo "These base changes already happened; undo them with:" >&2')
+            for branch in before:
+                undo = f"  gh api -X PATCH repos/{slug}/pulls/{branch.number} -f base={branch.current_base}"
+                lines.append(f"  echo {q(undo)} >&2")
+        lines += ["  exit 1", "fi", ""]
+    if after:
+        lines.append('echo "== Base changes after the push"')
+        lines += [f"patch_base {branch.number} {q(branch.new_base)}" for branch in after]
+        lines.append("")
+
+    lines += [
+        'echo "== Read back"',
+        "mismatches=0",
+        'remote_heads=$(git -C "$repo" ls-remote "$remote" ' + " ".join(q("refs/heads/" + b.name) for b in branches) + ")",
+        "check_head() {",
+        "  local got",
+        '  got=$(awk -v ref="refs/heads/$1" \'$2 == ref { print $1 }\' <<<"$remote_heads")',
+        '  if [ "$got" = "$2" ]; then',
+        '    echo "OK        $1 $2"',
+        "  else",
+        '    echo "MISMATCH  $1: expected $2, $remote has ${got:-nothing}"',
+        "    mismatches=$((mismatches + 1))",
+        "  fi",
+        "}",
+        "check_base() {",
+        "  local got",
+        '  got=$(gh api "repos/$slug/pulls/$1" --jq .base.ref)',
+        '  if [ "$got" = "$2" ]; then',
+        '    echo "OK        #$1 base $2"',
+        "  else",
+        '    echo "MISMATCH  #$1: expected base $2, GitHub has $got"',
+        "    mismatches=$((mismatches + 1))",
+        "  fi",
+        "}",
+    ]
+    lines += [f"check_head {q(branch.name)} {branch.new}" for branch in branches]
+    lines += [f"check_base {branch.number} {q(branch.new_base)}" for branch in branches if branch.number is not None]
+    lines += [
+        'if [ "$mismatches" -ne 0 ]; then',
+        '  echo "$mismatches mismatch(es); see above." >&2',
+        "  exit 1",
+        "fi",
+        'echo "Read-back OK"',
+    ]
+
+    if sync_workspace is not None and pushed:
+        lines += [
+            "",
+            'echo "== Sync workspace"',
+            f"workspace={q(str(sync_workspace))}",
+            'git -C "$workspace" fetch --quiet "$remote"',
+            "sync_branch() {",
+            "  local branch=$1 old=$2 new=$3 current worktree",
+            '  current=$(git -C "$workspace" rev-parse --quiet --verify "refs/heads/$branch" || true)',
+            '  if [ "$current" != "$old" ]; then',
+            '    echo "SKIP   $branch: the workspace branch is at ${current:-nothing}, not $old"',
+            "    return 0",
+            "  fi",
+            '  worktree=$(git -C "$workspace" worktree list --porcelain | awk -v want="branch refs/heads/$branch" \'/^worktree /{path=substr($0, 10)} $0 == want {print path}\')',
+            '  if [ -z "$worktree" ]; then',
+            '    if git -C "$workspace" branch --force "$branch" "$new"; then',
+            '      echo "MOVED  $branch"',
+            "    else",
+            '      echo "SKIP   $branch: git branch --force failed"',
+            "    fi",
+            '  elif [ -n "$(git -C "$worktree" status --porcelain --untracked-files=no)" ]; then',
+            '    echo "SKIP   $branch: $worktree has uncommitted changes"',
+            '  elif git -C "$worktree" reset --quiet --keep "$new"; then',
+            '    echo "MOVED  $branch in $worktree"',
+            "  else",
+            '    echo "SKIP   $branch: git reset --keep failed in $worktree"',
+            "  fi",
+            "}",
+        ]
+        lines += [f"sync_branch {q(branch.name)} {q(branch.old or '')} {branch.new}" for branch in pushed]
+    return "\n".join(lines) + "\n"
+
+
+def format_summary(branches: list[Branch]) -> str:
+    columns = ("branch", "pr", "old", "new", "push", "base")
+    rows = []
+    for branch in branches:
+        if branch.number is None:
+            base = "no open PR"
+        elif branch.timing:
+            base = f"{branch.current_base} -> {branch.new_base} ({branch.timing} push)"
+        else:
+            base = f"{branch.current_base} (unchanged)"
+        rows.append(
+            {
+                "branch": branch.name,
+                "pr": f"#{branch.number}" if branch.number is not None else "",
+                "old": branch.old[:7] if branch.old else "-",
+                "new": branch.new[:7],
+                "push": "yes" if branch.pushed else "no",
+                "base": base,
+            }
+        )
+    widths = {column: max(len(column), *(len(row[column]) for row in rows)) for column in columns}
+    lines = ["  ".join(column.ljust(widths[column]) for column in columns).rstrip()]
+    lines.append("  ".join("-" * widths[column] for column in columns))
+    lines += ["  ".join(row[column].ljust(widths[column]) for column in columns).rstrip() for row in rows]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Write a script that force-pushes a stack and fixes PR bases.")
+    parser.add_argument("--repo", default=".", help="repository holding the new heads as local branches")
+    parser.add_argument("--stack", help="stack selector, read through stack.py")
+    parser.add_argument("--stacks-dir", help="stack.py --stacks-dir")
+    parser.add_argument("--from", dest="from_pr", help="start at this PR instead of the bottom of the stack")
+    parser.add_argument(
+        "--branches", action="append", default=[], help="branches bottom first in the new order; replaces --stack"
+    )
+    parser.add_argument("--slug", help="GitHub owner/name; default: the stack record's repo")
+    parser.add_argument("--base", help="new base for the bottom PR; default: its current base")
+    parser.add_argument("--remote", default="origin", help="remote to push to, default: origin")
+    parser.add_argument("--sync-workspace", help="after the read-back, move this checkout's branches that still sit at their old heads")
+    parser.add_argument("--output", required=True, help="path of the bash script to write")
+    args = parser.parse_args()
+
+    try:
+        repo = Path(git(Path(args.repo).expanduser().resolve(), "rev-parse", "--show-toplevel").stdout.strip())
+        prs, record_slug = load_prs(args)
+        slug = args.slug or record_slug
+        if not slug:
+            raise StackPushError("pass --slug owner/name")
+        if not prs:
+            raise StackPushError("no PRs selected")
+        sync_workspace = None
+        if args.sync_workspace:
+            sync_workspace = Path(args.sync_workspace).expanduser().resolve()
+            git(sync_workspace, "rev-parse", "--git-dir")
+
+        branches = plan_branches(repo, args.remote, slug, prs, args.base)
+        refusals = check_order(repo, args.remote, slug, branches)
+        print(format_summary(branches))
+        if refusals:
+            print("\nRefusing to write a push script:", file=sys.stderr)
+            for refusal in refusals:
+                print(f"  {refusal}", file=sys.stderr)
+            return 1
+
+        output = Path(args.output).expanduser().resolve()
+        output.write_text(render_script(repo, args.remote, slug, branches, sync_workspace))
+        output.chmod(0o755)
+        print(f"\nWrote {output}. Read it, then run it yourself; it force-pushes.")
+        return 0
+    except StackPushError as exc:
+        print(f"stack-push: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
