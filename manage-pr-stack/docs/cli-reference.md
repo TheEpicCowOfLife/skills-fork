@@ -176,3 +176,33 @@ When the dry-run is clean and execution is authorized:
   --execute \
   --push
 ```
+
+## Compare Old And New Heads
+
+`scripts/stack-range-diff` shows what changed in each PR between two sets of heads, usually the pushed `origin/*` heads and rebuilt local branches:
+
+```bash
+./scripts/stack-range-diff --repo /tmp/wave/todo-app --stack ABC-123
+./scripts/stack-range-diff --repo /tmp/wave/todo-app --branches feature-one,feature-three,feature-two --base main
+```
+
+For each PR it runs `git range-diff <old-parent>..<old-head> <new-parent>..<new-head>` and counts the commit pairs: `=` unchanged, `!` rewritten, `>` new, `<` dropped. A PR whose pairs are all `=` is `unchanged`, even if its head moved because a PR below it changed.
+
+- `--old` and `--new` are the ref prefixes of the old and new heads, `refs/remotes/origin/` and `refs/heads/` by default. Pass `--old refs/backup/<wave>/` to compare against backup refs.
+- A PR's parent is the nearest other selected head that is an ancestor of its own head. The script works this out once among the old heads and once among the new heads, so a reorder needs no extra input, and the `note` column says where a PR moved.
+- An old head can sit on an older commit of the PR below it, one that PR has since replaced, so no other old head is its ancestor. Its range then starts at the newest commit in its history that matches a commit of the PR below by author, author date and subject, which rebases and amends keep. With no match it starts at the merge-base with that PR's old head. The note reads `old head was on an older commit of <branch>`.
+- The bottom PR's parent is the base branch: `--base`, which defaults to the bottom PR's `base_ref` in the stack record. It resolves as `<prefix><base>` first and then `<base>`. Use `--old-base` or `--new-base` when that would pick a stale branch.
+- `--from <pr>` starts at a PR above the bottom of the stack record. `--branches` takes an explicit list instead of the record, bottom first, comma-separated or repeated.
+- `--full <pr>` prints that PR's range-diff. `--markdown` prints the table and each changed PR's range-diff in a collapsed block, for a reviewer.
+
+The script only reads refs. Example, with `b` edited, `c` given one more commit, and `d` and `e` swapped:
+
+```text
+branch  old      new      =  !  >  <  status       note
+------  -------  -------  -  -  -  -  -----------  -------------------
+a       97d99b6  97d99b6  1  0  0  0  unchanged
+b       d3ba448  f92ad66  0  1  0  0  rewritten 1
+c       d6e7c9d  4ba9669  1  0  1  0  1 new
+e       7e218ca  8e30a4c  1  0  0  0  unchanged    moved from d onto c
+d       ea12e39  a3ee118  1  0  0  0  unchanged    moved from c onto e
+```

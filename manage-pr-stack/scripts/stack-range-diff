@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Summarise how each PR in a stack changed between old and new branch heads.
+
+Old heads come from --old (default refs/remotes/origin/, or a backup prefix
+such as refs/backup/<wave>/). New heads come from --new (default refs/heads/).
+Each PR's parent is the nearest other PR head that is an ancestor of its own
+head, worked out separately for the old and the new heads, so a reorder needs
+no extra input. The bottom PR's parent is the base branch.
+
+An old head that sits on an older commit of the PR below it, one that PR has
+since replaced, has no other head as an ancestor. Its parent is then the
+newest commit in its history that matches a commit of the PR below by author,
+author date and subject, else its merge-base with that PR's head.
+
+For each PR this runs
+
+    git range-diff <old-parent>..<old-head> <new-parent>..<new-head>
+
+and counts the commit pairs: = unchanged, ! rewritten, > new, < dropped.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+TICKET_PATTERN = re.compile(r"[A-Z][A-Z0-9]+-\d+")
+PAIR_PATTERN = re.compile(r"^\s*(?:\d+|-):\s+(?:[0-9a-f]+|-+)\s+([=!<>])\s+(?:\d+|-):\s+(?:[0-9a-f]+|-+)\s")
+
+
+class StackRangeDiffError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Pr:
+    branch: str
+    pr_id: str
+    tickets: tuple[str, ...]
+    number: int | None
+    url: str
+    base_ref: str
+
+
+@dataclass
+class Row:
+    pr: Pr
+    old_head: str | None
+    new_head: str
+    old_parent: str | None
+    new_parent: str
+    old_parent_name: str
+    new_parent_name: str
+    counts: dict[str, int]
+    range_diff: str
+    old_parent_is_older_commit: bool = False
+
+    @property
+    def status(self) -> str:
+        if self.old_head is None:
+            return "new branch"
+        parts = []
+        if self.counts["!"]:
+            parts.append(f"rewritten {self.counts['!']}")
+        if self.counts[">"]:
+            parts.append(f"{self.counts['>']} new")
+        if self.counts["<"]:
+            parts.append(f"{self.counts['<']} dropped")
+        return ", ".join(parts) or "unchanged"
+
+    @property
+    def note(self) -> str:
+        if self.old_head is None:
+            return ""
+        old_parent_name = self.old_parent_name
+        if self.old_parent_is_older_commit:
+            old_parent_name = f"an older commit of {old_parent_name}"
+            if self.old_parent_name == self.new_parent_name:
+                return f"old head was on {old_parent_name}"
+        if self.old_parent_name != self.new_parent_name:
+            return f"moved from {old_parent_name} onto {self.new_parent_name}"
+        return ""
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True)
+    if check and proc.returncode != 0:
+        raise StackRangeDiffError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc
+
+
+def find_oid(repo: Path, ref: str) -> str | None:
+    proc = git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    return proc.stdout.strip() or None
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return git(repo, "merge-base", "--is-ancestor", ancestor, descendant, check=False).returncode == 0
+
+
+def short(oid: str | None) -> str:
+    return oid[:7] if oid else "-"
+
+
+def read_stack_record(stack: str, stacks_dir: str | None) -> dict:
+    command = [sys.executable, str(SKILL_DIR / "stack.py")]
+    if stacks_dir:
+        command += ["--stacks-dir", stacks_dir]
+    proc = subprocess.run([*command, "--json", "show", stack], text=True, capture_output=True)
+    if proc.returncode != 0:
+        raise StackRangeDiffError(f"stack.py show {stack} failed: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def split_list(values: list[str]) -> list[str]:
+    return [item.strip() for value in values for item in value.split(",") if item.strip()]
+
+
+def pr_matches(pr: Pr, selector: str) -> bool:
+    number = selector.lstrip("#")
+    return selector in (pr.branch, pr.pr_id, *pr.tickets) or (pr.number is not None and number == str(pr.number))
+
+
+def select_pr(prs: list[Pr], selector: str) -> int:
+    matches = [index for index, pr in enumerate(prs) if pr_matches(pr, selector)]
+    if len(matches) != 1:
+        found = "no PR" if not matches else f"{len(matches)} PRs"
+        raise StackRangeDiffError(f"{selector!r} matched {found}; use a branch, PR id, or PR number")
+    return matches[0]
+
+
+def load_prs(args: argparse.Namespace) -> list[Pr]:
+    if args.branches:
+        return [
+            Pr(branch=branch, pr_id=branch, tickets=tuple(TICKET_PATTERN.findall(branch)), number=None, url="", base_ref="")
+            for branch in split_list(args.branches)
+        ]
+    if not args.stack:
+        raise StackRangeDiffError("pass --stack or --branches")
+    record = read_stack_record(args.stack, args.stacks_dir)
+    prs = [
+        Pr(
+            branch=pr["branch"],
+            pr_id=pr["id"],
+            tickets=tuple(ticket for ticket in pr["tickets"].split(",") if ticket),
+            number=pr["github_pr"],
+            url=pr["github"],
+            base_ref=pr["base_ref"],
+        )
+        for pr in record["prs"]
+    ]
+    if args.from_pr:
+        prs = prs[select_pr(prs, args.from_pr) :]
+    return prs
+
+
+def default_base(repo: Path, prs: list[Pr]) -> str:
+    if prs[0].base_ref:
+        return prs[0].base_ref
+    proc = git(repo, "rev-parse", "--abbrev-ref", "origin/HEAD", check=False)
+    if proc.returncode == 0 and "/" in proc.stdout:
+        return proc.stdout.strip().split("/", 1)[1]
+    raise StackRangeDiffError("cannot tell the base branch; pass --base")
+
+
+def resolve_base(repo: Path, explicit: str | None, prefix: str, base: str) -> str:
+    for ref in [explicit] if explicit else [f"{prefix}{base}", base]:
+        oid = find_oid(repo, ref)
+        if oid:
+            return oid
+    raise StackRangeDiffError(f"base {explicit or prefix + base} does not resolve")
+
+
+def nearest_parents(
+    repo: Path, heads: dict[str, str], order: list[str], base: str, base_name: str
+) -> dict[str, tuple[str, str]]:
+    """Map each branch to (parent oid, parent name): the nearest other head below it, else the base."""
+    parents = {}
+    for branch, oid in heads.items():
+        below = []
+        for other, other_oid in heads.items():
+            if other == branch or not is_ancestor(repo, other_oid, oid):
+                continue
+            # Equal heads (an empty PR) are ordered by the branch list.
+            if other_oid == oid and order.index(other) > order.index(branch):
+                continue
+            below.append(other)
+        nearest = None
+        for other in below:
+            if nearest is None or is_ancestor(repo, heads[nearest], heads[other]):
+                nearest = other
+        parents[branch] = (heads[nearest], nearest) if nearest else (base, base_name)
+    return parents
+
+
+def find_parent_on_older_commit(repo: Path, head: str, below_head: str) -> str | None:
+    """Where head's own commits start, when head sits on a commit the PR below has since replaced."""
+    merge_base = git(repo, "merge-base", head, below_head, check=False).stdout.strip()
+    if not merge_base or merge_base == head:
+        return None
+    # Rebases and amends keep a commit's author, author date and subject.
+    identity = "%an%x00%ae%x00%ad%x00%s"
+    below = set(git(repo, "log", f"--format={identity}", "--date=raw", f"{merge_base}..{below_head}").stdout.splitlines())
+    own = git(repo, "log", "--first-parent", f"--format=%H%x00{identity}", "--date=raw", f"{merge_base}..{head}").stdout
+    for line in own.splitlines():
+        commit, _, key = line.partition("\x00")
+        if key in below:
+            return commit
+    return merge_base
+
+
+def count_commits(repo: Path, revision_range: str) -> int:
+    return len(git(repo, "log", "--format=%H", revision_range).stdout.split())
+
+
+def range_diff(repo: Path, old_range: str, new_range: str, color: bool = False) -> str:
+    color_flag = "--color=always" if color else "--no-color"
+    return git(repo, "range-diff", color_flag, old_range, new_range).stdout
+
+
+def count_pairs(text: str) -> dict[str, int]:
+    counts = {"=": 0, "!": 0, ">": 0, "<": 0}
+    for line in text.splitlines():
+        match = PAIR_PATTERN.match(line)
+        if match:
+            counts[match.group(1)] += 1
+    return counts
+
+
+def build_rows(repo: Path, prs: list[Pr], args: argparse.Namespace) -> list[Row]:
+    base = args.base or default_base(repo, prs)
+    old_base = resolve_base(repo, args.old_base, args.old, base)
+    new_base = resolve_base(repo, args.new_base, args.new, base)
+    order = [pr.branch for pr in prs]
+
+    new_heads = {}
+    for pr in prs:
+        oid = find_oid(repo, f"{args.new}{pr.branch}")
+        if oid is None:
+            raise StackRangeDiffError(f"{args.new}{pr.branch} does not exist")
+        new_heads[pr.branch] = oid
+    old_heads = {pr.branch: oid for pr in prs if (oid := find_oid(repo, f"{args.old}{pr.branch}"))}
+
+    old_order = [branch for branch in order if branch in old_heads]
+    old_parents = nearest_parents(repo, old_heads, old_order, old_base, base)
+    new_parents = nearest_parents(repo, new_heads, order, new_base, base)
+
+    rows = []
+    for pr in prs:
+        new_parent, new_parent_name = new_parents[pr.branch]
+        new_range = f"{new_parent}..{new_heads[pr.branch]}"
+        old_head = old_heads.get(pr.branch)
+        if old_head is None:
+            added = count_commits(repo, new_range)
+            rows.append(
+                Row(pr, None, new_heads[pr.branch], None, new_parent, "", new_parent_name, {"=": 0, "!": 0, ">": added, "<": 0}, "")
+            )
+            continue
+        old_parent, old_parent_name = old_parents[pr.branch]
+        on_older_commit = False
+        position = old_order.index(pr.branch)
+        if position > 0:
+            below = old_order[position - 1]
+            if not is_ancestor(repo, old_heads[below], old_head):
+                start = find_parent_on_older_commit(repo, old_head, old_heads[below])
+                if start and not is_ancestor(repo, start, old_parent):
+                    old_parent, old_parent_name, on_older_commit = start, below, True
+        text = range_diff(repo, f"{old_parent}..{old_head}", new_range)
+        rows.append(
+            Row(
+                pr,
+                old_head,
+                new_heads[pr.branch],
+                old_parent,
+                new_parent,
+                old_parent_name,
+                new_parent_name,
+                count_pairs(text),
+                text,
+                on_older_commit,
+            )
+        )
+    return rows
+
+
+def label(pr: Pr) -> str:
+    return f"#{pr.number}" if pr.number is not None else pr.pr_id if pr.pr_id != pr.branch else ""
+
+
+def format_table(rows: list[Row]) -> str:
+    columns = ("pr", "branch", "old", "new", "=", "!", ">", "<", "status", "note")
+    if not any(label(row.pr) for row in rows):
+        columns = columns[1:]
+    table = [
+        {
+            "pr": label(row.pr),
+            "branch": row.pr.branch,
+            "old": short(row.old_head),
+            "new": short(row.new_head),
+            **{key: str(value) for key, value in row.counts.items()},
+            "status": row.status,
+            "note": row.note,
+        }
+        for row in rows
+    ]
+    widths = {column: max(len(column), *(len(item[column]) for item in table)) for column in columns}
+    lines = ["  ".join(column.ljust(widths[column]) for column in columns).rstrip()]
+    lines.append("  ".join("-" * widths[column] for column in columns))
+    lines += ["  ".join(item[column].ljust(widths[column]) for column in columns).rstrip() for item in table]
+    return "\n".join(lines)
+
+
+def format_markdown(rows: list[Row]) -> str:
+    has_labels = any(label(row.pr) for row in rows)
+    header = ["Branch", "Old head", "New head", "Status", "Note"]
+    if has_labels:
+        header.insert(0, "PR")
+    lines = ["| " + " | ".join(header) + " |", "|" + " --- |" * len(header)]
+    for row in rows:
+        cells = [f"`{row.pr.branch}`", f"`{short(row.old_head)}`", f"`{short(row.new_head)}`", row.status, row.note]
+        if has_labels:
+            cells.insert(0, f"[{label(row.pr)}]({row.pr.url})" if row.pr.url else label(row.pr))
+        lines.append("| " + " | ".join(cells) + " |")
+    for row in rows:
+        if row.status == "unchanged" or not row.range_diff:
+            continue
+        fence = "```"
+        while fence in row.range_diff:
+            fence += "`"
+        title = f"<code>{row.pr.branch}</code>"
+        if label(row.pr):
+            title = f"{label(row.pr)} {title}"
+        lines += [
+            "",
+            f"<details><summary>{title}: {row.status}</summary>",
+            "",
+            f"{fence}text",
+            row.range_diff.rstrip("\n"),
+            fence,
+            "",
+            "</details>",
+        ]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Summarise per-PR range-diffs between old and new stack heads.")
+    parser.add_argument("--repo", default=".", help="git repository path")
+    parser.add_argument("--stack", help="stack selector, read through stack.py")
+    parser.add_argument("--stacks-dir", help="stack.py --stacks-dir")
+    parser.add_argument("--from", dest="from_pr", help="start at this PR instead of the bottom of the stack")
+    parser.add_argument(
+        "--branches", action="append", default=[], help="branches bottom first, comma-separated or repeated; replaces --stack"
+    )
+    parser.add_argument("--old", default="refs/remotes/origin/", help="ref prefix of the old heads")
+    parser.add_argument("--new", default="refs/heads/", help="ref prefix of the new heads")
+    parser.add_argument("--base", help="base branch name; default: the bottom PR's base_ref, else origin/HEAD")
+    parser.add_argument("--old-base", help="old base ref; default: <old><base>, else <base>")
+    parser.add_argument("--new-base", help="new base ref; default: <new><base>, else <base>")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--full", metavar="PR", help="print the full range-diff of one PR")
+    output.add_argument("--markdown", action="store_true", help="print a Markdown summary with each changed PR's range-diff")
+    args = parser.parse_args()
+
+    repo = Path(args.repo).expanduser().resolve()
+    try:
+        prs = load_prs(args)
+        if not prs:
+            raise StackRangeDiffError("no PRs selected")
+        rows = build_rows(repo, prs, args)
+        if args.full:
+            row = rows[select_pr(prs, args.full)]
+            if row.old_head is None:
+                print(f"{row.pr.branch} has no old head; its {row.counts['>']} commit(s) are all new")
+                return 0
+            sys.stdout.write(
+                range_diff(
+                    repo,
+                    f"{row.old_parent}..{row.old_head}",
+                    f"{row.new_parent}..{row.new_head}",
+                    color=sys.stdout.isatty(),
+                )
+            )
+        elif args.markdown:
+            print(format_markdown(rows))
+        else:
+            print(format_table(rows))
+        return 0
+    except StackRangeDiffError as exc:
+        print(f"stack-range-diff: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

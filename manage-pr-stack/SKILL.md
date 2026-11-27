@@ -23,7 +23,8 @@ Use `stack.py` as the normal interface for reading and updating stack records. D
 - `examples/*.toml`: tracked example stack records.
 - `examples/*.events.jsonl`: tracked example event logs.
 - `scripts/stack-rebase`: helper for dry-running, rebasing, and force-pushing linear PR stack branches with explicit `--onto` boundaries and `--force-with-lease`. Its preflight refuses a boundary that would replay commits already in the new parent.
-- `tests/`: unittests for the CLI and the rebase boundary; run `python3 -m unittest discover -s tests` from the skill directory after changing `stack.py` or `scripts/stack-rebase`.
+- `scripts/stack-range-diff`: runs `git range-diff` for every PR between old heads (`origin/*` or a backup ref prefix) and new local heads, and labels each PR unchanged, rewritten, gaining commits or losing commits. It finds each PR's parent from ancestry, so reorders need no extra input. `--markdown` prints a summary to send to a reviewer.
+- `tests/`: unittests for the CLI and the scripts; run `python3 -m unittest discover -s tests` from the skill directory after changing `stack.py` or anything in `scripts/`.
 
 ## Core Rules
 
