@@ -191,6 +191,48 @@ When the dry-run is clean and execution is authorized:
   --push
 ```
 
+## Absorb Tip Edits
+
+`scripts/stack-absorb` takes edits made at the top of the stack and moves each hunk into the PR whose lines it changes:
+
+```bash
+./scripts/stack-absorb --repo /tmp/wave/todo-app --stack ABC-123 --edits wave-edits
+./scripts/stack-absorb --repo /tmp/wave/todo-app --stack ABC-123 --edits wave-edits \
+  --pin src/helpers.ts=ABC-124 --apply --message "[{ticket}] Write one expect per fact"
+```
+
+The edits are one commit whose parent is the top branch's head, passed as `--edits`. The commit can also be the top branch's head itself, and is then replaced by the routed commits. A commit works better than working-tree changes: it cannot change between the dry run and `--apply`, it carries new files without `git add -N`, the rebase needs a clean tree anyway, and it survives a reset of the stack branches, so the wave can be replayed after a change.
+
+Each hunk of `git diff <tip> <edits>` goes to the lowest PR whose head already holds its preimage:
+
+- `git blame` on the tip names the commit that last changed each removed line. The PR containing that commit is the lowest candidate, and lines from below the stack go to the bottom PR.
+- The hunk must apply at the candidate's head, with all its context or with `git apply -C1`. Otherwise the next PR up is tried. The `why` column says when context moved a hunk up or had to be reduced.
+- A hunk that only adds lines, including a new file, has no preimage. It is refused unless `--pin PATH=PR` or `--pin PATH:FIRST-LAST=PR` routes it. `FIRST-LAST` are line numbers in the edited file, and the refusal prints a pin that would match. `PATH` can be a glob, and `PR` is a branch, PR id, ticket or PR number.
+- Binary files and mode-only changes are refused; move them by hand. Renames show up as a deletion plus a new file.
+- `--unified N` sets the context per hunk (default 3). git diff joins edits whose context overlaps into one hunk, so lower it to route nearby edits separately.
+
+The dry run prints a table of hunks, the PR each goes to and why, then replays the stack with `git merge-tree` and compares the rebuilt tip with the edited tree. It exits 1 when a hunk is refused, the replay conflicts, or the trees differ.
+
+`--apply` needs `--message`, a template with `{ticket}`, `{pr_id}`, `{branch}` and `{pr}` filled from the stack record (with `--branches`, `{ticket}` comes from the branch name). It writes one commit per PR on top of that PR's head and runs one `git rebase --interactive --update-refs` from the lowest changed PR to the top branch, using itself as the sequence editor to put each commit just before its branch's `update-ref` line. It refuses when the working tree is dirty or a stack branch is checked out in another worktree, which `--update-refs` would skip. When rerere resolves every conflicting file at a stop, the script stages them, continues the rebase, and at the end lists each file rerere resolved with the commit it stopped at. It runs the rebase with `rerere.autoUpdate=false`, so that those files are still unmerged and it can tell which ones rerere resolved. A conflict rerere does not resolve stops the rebase as usual, and the script says which branch it was rebuilding, at which commit, and which files conflict. After the rebase finishes it checks that the top branch's tree equals the edited tree.
+
+Example dry run:
+
+```text
+hunk  file        lines        pr           why
+----  ----------  -----------  -----------  ---------------------------------------------------------------
+1     helper.txt  -0,0 +1,1    ABC-3-two    pinned by --pin helper.txt=ABC-3-two
+2     notes.txt   -3,7 +3,7    ABC-2-one    removes lines from b290470, in the bottom PR or below the stack
+3     one.txt     -3,7 +3,7    ABC-2-one    removes lines from 900fdc4, in the bottom PR or below the stack
+4     three.txt   -3,7 +3,7    ABC-4-three  removes lines from 4b03690 in ABC-4-three
+5     two.txt     -10,3 +10,4  ABC-3-two    pinned by --pin two.txt:13-13=ABC-3-two
+
+ABC-2-one: hunk(s) 2, 3
+ABC-3-two: hunk(s) 1, 5
+ABC-4-three: hunk(s) 4
+
+Simulation: OK: the rebuilt tip matches the edited tree.
+```
+
 ## Compare Old And New Heads
 
 `scripts/stack-range-diff` shows what changed in each PR between two sets of heads, usually the pushed `origin/*` heads and rebuilt local branches:

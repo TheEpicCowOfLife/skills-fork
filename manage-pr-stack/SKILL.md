@@ -23,6 +23,7 @@ Use `stack.py` as the normal interface for reading and updating stack records. D
 - `examples/*.toml`: tracked example stack records.
 - `examples/*.events.jsonl`: tracked example event logs.
 - `scripts/stack-rebase`: helper for dry-running, rebasing, and force-pushing linear PR stack branches with explicit `--onto` boundaries and `--force-with-lease`. Its preflight refuses a boundary that would replay commits already in the new parent.
+- `scripts/stack-absorb`: routes edits made at the stack tip, given as one commit, to the lowest PR whose head already holds each hunk's preimage, found with `git blame`. Hunks that only add lines need `--pin`. The dry run prints the routing and replays the stack to check the result; `--apply` writes one commit per PR and runs one `git rebase -i --update-refs`, continuing past any stop where rerere resolved every conflict.
 - `scripts/stack-range-diff`: runs `git range-diff` for every PR between old heads (`origin/*` or a backup ref prefix) and new local heads, and labels each PR unchanged, rewritten, gaining commits or losing commits. It finds each PR's parent from ancestry, so reorders need no extra input. `--markdown` prints a summary to send to a reviewer.
 - `scripts/stack-verify`: runs check commands on each stack head in turn, in one reused detached worktree. It caches passing results by tree and command list, re-runs a setup command only when its input files change, keeps a log per head, and exits non-zero on any failure.
 - `scripts/stack-push`: writes a bash script that pushes rebuilt stack branches in one `git push --atomic` with a `--force-with-lease` per branch, changes PR bases with `gh api` before or after the push so GitHub never sees a PR's head inside its base, and reads every head and base back. It pushes nothing itself; the user runs the script.
@@ -88,6 +89,42 @@ Use this when the user says a branch was pushed or adjusted and asks to update t
 6. Rebase each descendant in order and force-push because the user requested stack propagation.
 7. Stop and ask if conflicts are non-trivial, a descendant branch is missing, the local worktree contains unrelated dirty changes, or observed topology differs from the stack record.
 8. Append a concise event naming the changed parent and rebased descendant range.
+
+### Run A Restack Wave
+
+A wave edits commits in the middle of a stack, sometimes reorders PRs, then force-pushes every descendant and fixes GitHub PR bases. Build it as real commits with git's rebase. A later change to the wave is then an amend and another rebase.
+
+1. Claim the stack as the Core Rules describe, after checking for an open claim.
+2. Fetch the workspace, then build the wave in a throwaway clone that borrows the workspace's objects, with local branches made from `origin/*` and rerere enabled:
+
+   ```bash
+   git -C <workspace> fetch origin
+   git clone --reference <workspace> <remote-url> /tmp/wave/<repo>
+   git -C /tmp/wave/<repo> config rerere.enabled true
+   git -C /tmp/wave/<repo> config rerere.autoUpdate true
+   for branch in <stack branches>; do git -C /tmp/wave/<repo> branch --force "$branch" "origin/$branch"; done
+   ```
+
+   `git rebase --update-refs` does not move a branch that is checked out in another worktree, and the workspace usually has several. The clone has none. It does move every other local branch that points into the rebased range, so keep backups outside `refs/heads`, for example `git update-ref refs/backup/<wave>/<branch> origin/<branch>`.
+3. Make the edits as one commit on a branch of their own, on top of the stack tip. Route them with `scripts/stack-absorb` from the skill directory, dry run first:
+
+   ```bash
+   git -C /tmp/wave/<repo> switch -c wave-edits <top branch>
+   # edit files in /tmp/wave/<repo>, then
+   git -C /tmp/wave/<repo> commit -am "Wave edits"
+   ./scripts/stack-absorb --repo /tmp/wave/<repo> --stack <stack> --edits wave-edits
+   ./scripts/stack-absorb --repo /tmp/wave/<repo> --stack <stack> --edits wave-edits \
+     --pin src/helper.ts=<pr> --apply --message "[{ticket}] Write one expect per fact"
+   ```
+
+   The dry run shows which PR each hunk goes to and why, and checks that the rebuilt tip equals the edited tree. A hunk that only adds lines, such as a helper moving down to an earlier PR, needs a `--pin`.
+4. For what absorb cannot express, such as reordering PRs or moving a commit between PRs, run one `git rebase -i --update-refs` over the whole stack. Agents have no interactive terminal, so set `GIT_SEQUENCE_EDITOR` to a script that rewrites the todo file, and `GIT_EDITOR=true` so no message editor opens. Moving a PR means moving its `pick` lines together with its `update-ref` line. Until the stack record matches the new order, pass the order to the scripts with `--branches`.
+5. A conflict stops the rebase in the normal way. Resolve it, `git add` the files, and run `GIT_EDITOR=true git rebase --continue`. rerere records the resolution. When the same conflict comes up again, rerere applies the recorded resolution. `stack-absorb` then stages it and continues by itself, and lists each file rerere resolved at the end. A plain `git rebase` still stops there: check the staged result and continue.
+6. When a ruling or the order changes, reset the stack branches to `origin/*`, amend `wave-edits` or the sequence editor script, and run the absorb or rebase again. Only new conflicts need attention.
+7. Run the checks on every head with `scripts/stack-verify`. Heads whose trees did not change come from its cache.
+8. Review what changed per PR with `scripts/stack-range-diff`, and use `--markdown` for a note to reviewers.
+9. Write the push script with `scripts/stack-push --sync-workspace <workspace> --output /tmp/wave/push.sh` and hand it to the user. Do not run it. If PRs moved, update the stack record's order, `parent` and `base_ref` to match; `stack.py` has no reorder command, so this is a direct TOML edit followed by `validate`.
+10. After the user runs the script, record a `push` event, which also releases the claim. If the wave is dropped instead, record an `abandon` event. Then delete the clone and the verify worktree beside it.
 
 ### Prepare A Stack Operation
 

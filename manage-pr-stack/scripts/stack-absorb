@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""Route edits made at the stack tip back to the PRs whose lines they change.
+
+The edits are one commit whose parent is the top branch's head (--edits).
+The commit can also be the top branch's head itself; the routed commits then
+replace it. Each hunk of `git diff <tip> <edits>` goes to the lowest PR whose
+head holds its preimage:
+
+- `git blame` on the tip finds the commit that last changed each removed line,
+  and that commit's PR is the lowest candidate. Lines from below the stack go
+  to the lowest PR.
+- The hunk must apply at the candidate's head, first with all its context and
+  then with `git apply -C1`. If it applies at neither, the next PR up is tried.
+- A hunk that only adds lines has no preimage to route by. It is refused
+  unless --pin names its PR.
+
+The dry run prints the routing and replays the whole stack with
+`git merge-tree` to check that the rebuilt tip equals the edited tree.
+--apply writes one commit per PR on top of that PR's head and runs one
+`git rebase -i --update-refs`, with this script as the sequence editor,
+inserting each commit just before its branch's update-ref line. When rerere
+resolves every conflict at a stop, the script stages the result and continues.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+TICKET_PATTERN = re.compile(r"[A-Z][A-Z0-9]+-\d+")
+HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+BLAME_HEADER = re.compile(r"^([0-9a-f]{40,64}) \d+ (\d+)")
+PIN_RANGE = re.compile(r"^(.*):(\d+)(?:-(\d+))?$")
+CONFLICT_MARKER = re.compile(rb"^(?:<{7}|>{7})(?: |$)", re.MULTILINE)
+# rerere leaves its resolutions unstaged, so every file it resolved shows up as unmerged at the stop.
+REBASE_RERERE_CONFIG = ("-c", "rerere.autoUpdate=false")
+
+
+class StackAbsorbError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Pr:
+    branch: str
+    pr_id: str
+    tickets: tuple[str, ...]
+    number: int | None
+
+    @property
+    def label(self) -> str:
+        return f"#{self.number} {self.branch}" if self.number is not None else self.branch
+
+
+@dataclass
+class Hunk:
+    index: int
+    path: str
+    file_header: list[str]
+    body: list[str]
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    removed: list[int] = field(default_factory=list)
+    added: list[int] = field(default_factory=list)
+    target: int | None = None
+    fuzzy: bool = False
+    why: str = ""
+
+    @property
+    def lines_label(self) -> str:
+        return f"-{self.old_start},{self.old_count} +{self.new_start},{self.new_count}"
+
+    @property
+    def added_range(self) -> tuple[int, int]:
+        if self.added:
+            return self.added[0], self.added[-1]
+        return self.new_start, self.new_start + max(self.new_count, 1) - 1
+
+    @property
+    def patch(self) -> str:
+        return "\n".join([*self.file_header, *self.body]) + "\n"
+
+
+@dataclass(frozen=True)
+class Pin:
+    spec: str
+    path: str
+    first: int | None
+    last: int | None
+    target: int
+
+    def matches(self, hunk: Hunk) -> bool:
+        if hunk.path != self.path and not fnmatch.fnmatch(hunk.path, self.path):
+            return False
+        if self.first is None:
+            return True
+        first_added, last_added = hunk.added_range
+        return first_added <= self.last and last_added >= self.first
+
+
+@dataclass
+class Stack:
+    repo: Path
+    prs: list[Pr]
+    heads: list[str]
+    edits: str
+    edits_on_top_branch: bool
+    pr_of_commit: dict[str, int]
+    commits: list[list[str]]
+
+
+def git(
+    repo: Path, *args: str, check: bool = True, env: dict[str, str] | None = None, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True, env=env, input=stdin)
+    if check and proc.returncode != 0:
+        raise StackAbsorbError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc
+
+
+def find_oid(repo: Path, ref: str) -> str | None:
+    proc = git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    return proc.stdout.strip() or None
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return git(repo, "merge-base", "--is-ancestor", ancestor, descendant, check=False).returncode == 0
+
+
+def tree_of(repo: Path, commit: str) -> str:
+    return git(repo, "rev-parse", f"{commit}^{{tree}}").stdout.strip()
+
+
+def read_stack_record(stack: str, stacks_dir: str | None) -> dict:
+    command = [sys.executable, str(SKILL_DIR / "stack.py")]
+    if stacks_dir:
+        command += ["--stacks-dir", stacks_dir]
+    proc = subprocess.run([*command, "--json", "show", stack], text=True, capture_output=True)
+    if proc.returncode != 0:
+        raise StackAbsorbError(f"stack.py show {stack} failed: {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
+
+
+def split_list(values: list[str]) -> list[str]:
+    return [item.strip() for value in values for item in value.split(",") if item.strip()]
+
+
+def pr_matches(pr: Pr, selector: str) -> bool:
+    number = selector.lstrip("#")
+    return selector in (pr.branch, pr.pr_id, *pr.tickets) or (pr.number is not None and number == str(pr.number))
+
+
+def select_pr(prs: list[Pr], selector: str) -> int:
+    matches = [index for index, pr in enumerate(prs) if pr_matches(pr, selector)]
+    if len(matches) != 1:
+        found = "no PR" if not matches else f"{len(matches)} PRs"
+        raise StackAbsorbError(f"{selector!r} matched {found}; use a branch, PR id, or PR number")
+    return matches[0]
+
+
+def load_prs(args: argparse.Namespace) -> list[Pr]:
+    if args.branches:
+        return [
+            Pr(branch=branch, pr_id=branch, tickets=tuple(TICKET_PATTERN.findall(branch)), number=None)
+            for branch in split_list(args.branches)
+        ]
+    if not args.stack:
+        raise StackAbsorbError("pass --stack or --branches")
+    record = read_stack_record(args.stack, args.stacks_dir)
+    prs = [
+        Pr(
+            branch=pr["branch"],
+            pr_id=pr["id"],
+            tickets=tuple(ticket for ticket in pr["tickets"].split(",") if ticket),
+            number=pr["github_pr"],
+        )
+        for pr in record["prs"]
+    ]
+    if args.from_pr:
+        prs = prs[select_pr(prs, args.from_pr) :]
+    return prs
+
+
+def load_stack(repo: Path, prs: list[Pr], edits_ref: str) -> Stack:
+    heads = []
+    for pr in prs:
+        oid = find_oid(repo, f"refs/heads/{pr.branch}")
+        if oid is None:
+            raise StackAbsorbError(f"local branch {pr.branch} does not exist")
+        heads.append(oid)
+    edits = find_oid(repo, edits_ref)
+    if edits is None:
+        raise StackAbsorbError(f"--edits {edits_ref} does not resolve to a commit")
+    parents = git(repo, "rev-list", "--parents", "-n", "1", edits).stdout.split()[1:]
+    edits_on_top_branch = edits == heads[-1]
+    if len(parents) != 1:
+        raise StackAbsorbError("the edits commit must have exactly one parent")
+    if edits_on_top_branch:
+        heads[-1] = parents[0]
+    elif parents[0] != heads[-1]:
+        raise StackAbsorbError(
+            f"the edits commit {edits[:7]} must sit directly on {prs[-1].branch} ({heads[-1][:7]}), or be its head"
+        )
+    for index in range(1, len(heads)):
+        if not is_ancestor(repo, heads[index - 1], heads[index]):
+            raise StackAbsorbError(f"{prs[index].branch} does not contain {prs[index - 1].branch}; the stack is not linear")
+
+    pr_of_commit: dict[str, int] = {}
+    commits: list[list[str]] = [[]]
+    for index in range(1, len(heads)):
+        listing = git(repo, "rev-list", "--reverse", "--parents", f"{heads[index - 1]}..{heads[index]}").stdout
+        own = []
+        for line in listing.splitlines():
+            commit, *commit_parents = line.split()
+            if len(commit_parents) != 1:
+                raise StackAbsorbError(f"{prs[index].branch} contains merge commit {commit[:7]}; only linear stacks work")
+            pr_of_commit[commit] = index
+            own.append(commit)
+        commits.append(own)
+    return Stack(repo, prs, heads, edits, edits_on_top_branch, pr_of_commit, commits)
+
+
+def parse_diff(text: str) -> tuple[list[Hunk], list[str]]:
+    """Return the hunks and a reason for each file change that has no text hunk."""
+    hunks: list[Hunk] = []
+    unroutable: list[str] = []
+    files: list[list[str]] = []
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            files.append([line])
+        elif files:
+            files[-1].append(line)
+    for lines in files:
+        header_end = next((i for i, line in enumerate(lines) if line.startswith("@@")), len(lines))
+        header = [line for line in lines[:header_end] if not line.startswith("index ")]
+        old_path = next((line[6:] for line in header if line.startswith("--- a/")), None)
+        new_path = next((line[6:] for line in header if line.startswith("+++ b/")), None)
+        path = new_path or old_path or lines[0].split(" b/", 1)[-1]
+        if path.startswith('"'):
+            raise StackAbsorbError(f"quoted path {path} is not supported")
+        if header_end == len(lines):
+            kind = "binary file" if any(line.startswith("Binary files") for line in lines) else "mode change only"
+            unroutable.append(f"{path}: {kind}; move it by hand")
+            continue
+        current: Hunk | None = None
+        old_line = new_line = 0
+        for line in lines[header_end:]:
+            match = HUNK_HEADER.match(line)
+            if match:
+                old_start, old_count, new_start, new_count = (
+                    int(match.group(1)),
+                    int(match.group(2) or 1),
+                    int(match.group(3)),
+                    int(match.group(4) or 1),
+                )
+                current = Hunk(len(hunks) + 1, path, header, [line], old_start, old_count, new_start, new_count)
+                hunks.append(current)
+                old_line, new_line = old_start, new_start
+                continue
+            current.body.append(line)
+            if line.startswith("-"):
+                current.removed.append(old_line)
+                old_line += 1
+            elif line.startswith("+"):
+                current.added.append(new_line)
+                new_line += 1
+            elif line.startswith(" "):
+                old_line += 1
+                new_line += 1
+    return hunks, unroutable
+
+
+def blame_commits(repo: Path, tip: str, path: str, lines: list[int]) -> dict[int, str]:
+    ranges = []
+    for line in sorted(lines):
+        if ranges and line == ranges[-1][1] + 1:
+            ranges[-1][1] = line
+        else:
+            ranges.append([line, line])
+    args = [arg for first, last in ranges for arg in ("-L", f"{first},{last}")]
+    output = git(repo, "blame", "--porcelain", *args, tip, "--", path).stdout
+    return {
+        int(match.group(2)): match.group(1)
+        for line in output.splitlines()
+        if (match := BLAME_HEADER.match(line))
+    }
+
+
+class Indexes:
+    """One temporary index per PR head, for `git apply --cached --check`."""
+
+    def __init__(self, repo: Path, directory: Path) -> None:
+        self.repo = repo
+        self.directory = directory
+        self.paths: dict[str, Path] = {}
+
+    def env_for(self, commit: str) -> dict[str, str]:
+        path = self.paths.get(commit)
+        if path is None:
+            path = self.directory / f"index-{len(self.paths)}"
+            git(self.repo, "read-tree", commit, env={**os.environ, "GIT_INDEX_FILE": str(path)})
+            self.paths[commit] = path
+        return {**os.environ, "GIT_INDEX_FILE": str(path)}
+
+
+def apply_args(fuzzy: bool, check: bool) -> list[str]:
+    return ["apply", "--cached", "--whitespace=nowarn", *(["--check"] if check else []), *(["-C1"] if fuzzy else []), "-"]
+
+
+def applies(repo: Path, indexes: Indexes, commit: str, hunk: Hunk, fuzzy: bool) -> bool:
+    proc = git(repo, *apply_args(fuzzy, check=True), check=False, env=indexes.env_for(commit), stdin=hunk.patch)
+    return proc.returncode == 0
+
+
+def route(stack: Stack, hunks: list[Hunk], pins: list[Pin], indexes: Indexes) -> list[str]:
+    """Set each hunk's target and return the reasons for hunks that cannot be routed."""
+    refusals = []
+    used_pins = set()
+    top = len(stack.prs) - 1
+    blame_cache: dict[str, dict[int, str]] = {}
+    for path in {hunk.path for hunk in hunks if hunk.removed}:
+        removed = [line for hunk in hunks if hunk.path == path for line in hunk.removed]
+        blame_cache[path] = blame_commits(stack.repo, stack.heads[-1], path, removed)
+
+    for hunk in hunks:
+        pin = next((pin for pin in pins if pin.matches(hunk)), None)
+        if pin is not None:
+            used_pins.add(pin.spec)
+            candidates = [pin.target]
+            reason = f"pinned by --pin {pin.spec}"
+        elif not hunk.removed:
+            refusals.append(
+                f"hunk {hunk.index} {hunk.path} {hunk.lines_label}: adds lines only, so it has no preimage to route by; "
+                f"pin it with --pin {hunk.path}:{hunk.added_range[0]}-{hunk.added_range[1]}=<pr>"
+            )
+            continue
+        else:
+            origins = [blame_cache[hunk.path][line] for line in hunk.removed]
+            first_holder = max(stack.pr_of_commit.get(commit, 0) for commit in origins)
+            source = next(commit for commit in origins if stack.pr_of_commit.get(commit, 0) == first_holder)
+            if source in stack.pr_of_commit:
+                reason = f"removes lines from {source[:7]} in {stack.prs[first_holder].label}"
+            else:
+                reason = f"removes lines from {source[:7]}, in the bottom PR or below the stack"
+            candidates = list(range(first_holder, top + 1))
+
+        for target in candidates:
+            fuzzy = next(
+                (fuzzy for fuzzy in (False, True) if applies(stack.repo, indexes, stack.heads[target], hunk, fuzzy)), None
+            )
+            if fuzzy is not None:
+                hunk.target, hunk.fuzzy = target, fuzzy
+                notes = [reason]
+                if target != candidates[0]:
+                    notes.append(f"its context first exists in {stack.prs[target].label}")
+                if fuzzy:
+                    notes.append("applies with reduced context")
+                hunk.why = "; ".join(notes)
+                break
+        else:
+            where = stack.prs[candidates[0]].label
+            above = " or above" if len(candidates) > 1 else ""
+            refusals.append(f"hunk {hunk.index} {hunk.path} {hunk.lines_label}: {reason}, but it does not apply at {where}{above}")
+    for pin in pins:
+        if pin.spec not in used_pins:
+            refusals.append(f"--pin {pin.spec} matches no hunk")
+    return refusals
+
+
+def format_message(template: str, pr: Pr) -> str:
+    values = {
+        "ticket": pr.tickets[0] if pr.tickets else None,
+        "pr_id": pr.pr_id,
+        "branch": pr.branch,
+        "pr": pr.number,
+    }
+    keys = re.findall(r"\{(\w+)\}", template)
+    for key in keys:
+        if key not in values:
+            raise StackAbsorbError(f"--message uses {{{key}}}; known fields are {', '.join(values)}")
+        if values[key] is None:
+            raise StackAbsorbError(f"--message uses {{{key}}}, which {pr.branch} does not have")
+    return template.format(**values)
+
+
+def build_commits(stack: Stack, hunks: list[Hunk], indexes_dir: Path, template: str | None) -> dict[int, str]:
+    """Write one commit per target PR on top of its head and return {pr index: commit}."""
+    built = {}
+    for target in sorted({hunk.target for hunk in hunks}):
+        env = {**os.environ, "GIT_INDEX_FILE": str(indexes_dir / f"build-{target}")}
+        git(stack.repo, "read-tree", stack.heads[target], env=env)
+        for hunk in (hunk for hunk in hunks if hunk.target == target):
+            proc = git(stack.repo, *apply_args(hunk.fuzzy, check=False), check=False, env=env, stdin=hunk.patch)
+            if proc.returncode != 0:
+                raise StackAbsorbError(
+                    f"hunk {hunk.index} applies alone at {stack.prs[target].branch} but not after the hunks before it:\n"
+                    f"{proc.stderr.strip()}"
+                )
+        tree = git(stack.repo, "write-tree", env=env).stdout.strip()
+        pr = stack.prs[target]
+        message = format_message(template, pr) if template else f"stack-absorb dry run for {pr.branch}"
+        built[target] = git(stack.repo, "commit-tree", tree, "-p", stack.heads[target], "-m", message).stdout.strip()
+    return built
+
+
+def simulate(stack: Stack, built: dict[int, str]) -> str:
+    """Replay the stack with the new commits and describe the outcome in one line."""
+    first = min(built)
+    current = built[first]
+    for index in range(first + 1, len(stack.prs)):
+        replay = stack.commits[index] + ([built[index]] if index in built else [])
+        for commit in replay:
+            parent = git(stack.repo, "rev-parse", f"{commit}^").stdout.strip()
+            proc = git(
+                stack.repo,
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                f"--merge-base={parent}",
+                current,
+                commit,
+                check=False,
+            )
+            if proc.returncode == 1:
+                files = sorted({line for line in proc.stdout.split("\n\n")[0].splitlines()[1:] if line})
+                subject = git(stack.repo, "log", "-1", "--format=%h %s", commit).stdout.strip()
+                return (
+                    f"CONFLICT replaying {subject} onto the rebuilt {stack.prs[index].branch}, in {', '.join(files)}. "
+                    "--apply stops there unless rerere holds a resolution."
+                )
+            if proc.returncode != 0:
+                raise StackAbsorbError(f"git merge-tree failed: {proc.stderr.strip()}")
+            tree = proc.stdout.splitlines()[0]
+            current = git(stack.repo, "commit-tree", tree, "-p", current, "-m", "stack-absorb simulation").stdout.strip()
+    if tree_of(stack.repo, current) == tree_of(stack.repo, stack.edits):
+        return "OK: the rebuilt tip matches the edited tree."
+    changed = git(stack.repo, "diff", "--name-only", current, stack.edits).stdout.split()
+    return f"MISMATCH: the rebuilt tip differs from the edited tree in {', '.join(changed)}."
+
+
+def format_routing(stack: Stack, hunks: list[Hunk]) -> str:
+    columns = ("hunk", "file", "lines", "pr", "why")
+    rows = [
+        {
+            "hunk": str(hunk.index),
+            "file": hunk.path,
+            "lines": hunk.lines_label,
+            "pr": stack.prs[hunk.target].label if hunk.target is not None else "REFUSED",
+            "why": hunk.why,
+        }
+        for hunk in hunks
+    ]
+    if not rows:
+        return "No text hunks."
+    widths = {column: max(len(column), *(len(row[column]) for row in rows)) for column in columns}
+    lines = ["  ".join(column.ljust(widths[column]) for column in columns).rstrip()]
+    lines.append("  ".join("-" * widths[column] for column in columns))
+    lines += ["  ".join(row[column].ljust(widths[column]) for column in columns).rstrip() for row in rows]
+    return "\n".join(lines)
+
+
+def parse_pins(specs: list[str], prs: list[Pr]) -> list[Pin]:
+    pins = []
+    for spec in specs:
+        location, separator, selector = spec.rpartition("=")
+        if not separator or not location:
+            raise StackAbsorbError(f"--pin {spec}: expected PATH=PR or PATH:FIRST-LAST=PR")
+        match = PIN_RANGE.match(location)
+        if match:
+            first = int(match.group(2))
+            pins.append(Pin(spec, match.group(1), first, int(match.group(3) or first), select_pr(prs, selector)))
+        else:
+            pins.append(Pin(spec, location, None, None, select_pr(prs, selector)))
+    return pins
+
+
+def edit_todo(plan_path: Path, todo_path: Path) -> int:
+    """Sequence editor: insert each new commit before its branch's update-ref line."""
+    plan = json.loads(plan_path.read_text())
+    inserts: dict[str, str] = dict(plan["inserts"])
+    output = []
+    if plan["prepend"]:
+        output += [f"pick {plan['prepend']['commit']}", f"update-ref {plan['prepend']['ref']}", ""]
+    for line in todo_path.read_text().splitlines():
+        words = line.split()
+        if len(words) >= 2 and words[0] in ("update-ref", "u") and words[1] in inserts:
+            output.append(f"pick {inserts.pop(words[1])}")
+        if len(words) >= 2 and words[0] in ("pick", "p") and plan["drop"] and plan["drop"].startswith(words[1]):
+            line = f"drop {words[1]}"
+        output.append(line)
+    if inserts:
+        print(
+            "stack-absorb: no update-ref line for "
+            + ", ".join(inserts)
+            + "; a branch checked out in another worktree is the usual cause",
+            file=sys.stderr,
+        )
+        return 1
+    if plan["append"]:
+        output.append(f"pick {plan['append']}")
+    todo_path.write_text("\n".join(output) + "\n")
+    return 0
+
+
+def run_rebase(stack: Stack, built: dict[int, str], git_dir: Path) -> int:
+    top = len(stack.prs) - 1
+    first = min(built)
+    plan = {
+        "prepend": None,
+        "inserts": {f"refs/heads/{stack.prs[i].branch}": commit for i, commit in built.items() if first < i < top},
+        "append": built.get(top),
+        "drop": stack.edits if stack.edits_on_top_branch else None,
+    }
+    if first < top:
+        # The lowest branch's head is the rebase upstream, so the todo has no update-ref line for it.
+        plan["prepend"] = {"commit": built[first], "ref": f"refs/heads/{stack.prs[first].branch}"}
+    plan_path = git_dir / "stack-absorb-plan.json"
+    plan_path.write_text(json.dumps(plan))
+    editor = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} --edit-todo {shlex.quote(str(plan_path))}"
+    env = {**os.environ, "GIT_SEQUENCE_EDITOR": editor, "GIT_EDITOR": "true"}
+    command = [
+        "git",
+        "-c",
+        "rebase.abbreviateCommands=false",
+        *REBASE_RERERE_CONFIG,
+        "rebase",
+        "--interactive",
+        "--update-refs",
+        "--no-autosquash",
+        "--reapply-cherry-picks",
+        "--empty=keep",
+        stack.heads[first],
+        stack.prs[top].branch,
+    ]
+    return subprocess.run(command, cwd=stack.repo, env=env).returncode
+
+
+def branches_checked_out_elsewhere(repo: Path, prs: list[Pr]) -> list[str]:
+    here = git(repo, "rev-parse", "--show-toplevel").stdout.strip()
+    listing = git(repo, "worktree", "list", "--porcelain").stdout
+    found = []
+    worktree = ""
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            worktree = line.removeprefix("worktree ")
+        elif line.startswith("branch refs/heads/") and Path(worktree).resolve() != Path(here).resolve():
+            branch = line.removeprefix("branch refs/heads/")
+            if any(pr.branch == branch for pr in prs):
+                found.append(f"{branch} (in {worktree})")
+    return found
+
+
+def is_rerere_enabled(repo: Path) -> bool:
+    setting = git(repo, "config", "--type=bool", "--get", "rerere.enabled", check=False).stdout.strip()
+    if setting:
+        return setting == "true"
+    common_dir = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    return (Path(common_dir) / "rr-cache").is_dir()
+
+
+def unmerged_paths(repo: Path) -> list[str]:
+    listing = git(repo, "diff", "--name-only", "-z", "--diff-filter=U").stdout
+    return sorted({path for path in listing.split("\0") if path})
+
+
+def find_rerere_resolutions(repo: Path) -> tuple[list[str], list[str]]:
+    """Split the unmerged paths at a rebase stop into (resolved by rerere, left for a person)."""
+    unmerged = unmerged_paths(repo)
+    if not unmerged or not is_rerere_enabled(repo):
+        return [], unmerged
+    remaining = set(git(repo, "rerere", "remaining").stdout.splitlines())
+    resolved, left = [], []
+    for path in unmerged:
+        file = repo / path
+        is_clean = path not in remaining and file.is_file() and not CONFLICT_MARKER.search(file.read_bytes())
+        (resolved if is_clean else left).append(path)
+    return resolved, left
+
+
+def describe_position(repo: Path, git_dir: Path, prs: list[Pr]) -> tuple[str, str]:
+    """The branch being rebuilt and the commit the rebase stopped at."""
+    todo = git_dir / "rebase-merge" / "git-rebase-todo"
+    remaining = todo.read_text() if todo.exists() else ""
+    building = next(
+        (line.split()[1].removeprefix("refs/heads/") for line in remaining.splitlines() if line.startswith("update-ref ")),
+        prs[-1].branch,
+    )
+    stopped = git(repo, "rev-parse", "--verify", "--quiet", "REBASE_HEAD", check=False).stdout.strip()
+    subject = git(repo, "log", "-1", "--format=%h %s", stopped).stdout.strip() if stopped else "an unknown commit"
+    return building, subject
+
+
+def continue_with_rerere(repo: Path, git_dir: Path, prs: list[Pr], replayed: list[str]) -> int:
+    """Stage rerere's resolutions and continue the rebase until it finishes or stops on a conflict rerere left."""
+    while (git_dir / "rebase-merge").exists():
+        resolved, left = find_rerere_resolutions(repo)
+        if not resolved or left:
+            return 1
+        building, subject = describe_position(repo, git_dir, prs)
+        git(repo, "add", "--", *resolved)
+        replayed += [f"{path} at {subject}, rebuilding {building}" for path in resolved]
+        print(f"\nstack-absorb: rerere resolved {', '.join(resolved)} at {subject}; continuing.", flush=True)
+        command = ["git", *REBASE_RERERE_CONFIG, "rebase", "--continue"]
+        if subprocess.run(command, cwd=repo, env={**os.environ, "GIT_EDITOR": "true"}).returncode == 0:
+            return 0
+    return 1
+
+
+def describe_stop(repo: Path, git_dir: Path, prs: list[Pr], built: dict[int, str], replayed: list[str]) -> str:
+    if not (git_dir / "rebase-merge").exists():
+        return "The rebase did not start; see git's message above. No branch moved."
+    building, subject = describe_position(repo, git_dir, prs)
+    resolved, left = find_rerere_resolutions(repo)
+    absorbed = ", ".join(f"{prs[i].branch} {commit[:7]}" for i, commit in sorted(built.items()))
+    if left:
+        next_step = f"Conflicting files: {', '.join(left)}.\n"
+        if resolved:
+            next_step += f"rerere resolved {', '.join(resolved)}; check and git add those as well.\n"
+        next_step += (
+            "Resolve them, git add them, and run GIT_EDITOR=true git rebase --continue. With rerere enabled, "
+            "the resolution is replayed the next time."
+        )
+    else:
+        next_step = "No unmerged files are left; see git's message above for why it stopped."
+    earlier = "".join(f"\nrerere resolved {line}." for line in replayed)
+    return (
+        f"The rebase stopped while rebuilding {building}, at {subject}.\n{next_step}\n"
+        "git rebase --abort puts every branch back.\n"
+        f"The new commits stay reachable until gc: {absorbed}.{earlier}"
+    )
+
+
+def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--edit-todo":
+        return edit_todo(Path(sys.argv[2]), Path(sys.argv[3]))
+
+    parser = argparse.ArgumentParser(description="Route tip edits to the PRs whose lines they change.")
+    parser.add_argument("--repo", default=".", help="git repository path, with the stack as local branches")
+    parser.add_argument("--stack", help="stack selector, read through stack.py")
+    parser.add_argument("--stacks-dir", help="stack.py --stacks-dir")
+    parser.add_argument("--from", dest="from_pr", help="start at this PR instead of the bottom of the stack")
+    parser.add_argument("--branches", action="append", default=[], help="branches bottom first; replaces --stack")
+    parser.add_argument(
+        "--edits", required=True, help="commit holding the edits: a child of the top branch's head, or that head itself"
+    )
+    parser.add_argument(
+        "--pin", action="append", default=[], help="PATH=PR or PATH:FIRST-LAST=PR (new-side lines); routes matching hunks to PR"
+    )
+    parser.add_argument("--unified", type=int, default=3, help="context lines per hunk, at least 1; default 3")
+    parser.add_argument("--apply", action="store_true", help="write the commits and rebase; default is a dry run")
+    parser.add_argument("--message", help="commit message template for --apply; fields {ticket} {pr_id} {branch} {pr}")
+    args = parser.parse_args()
+    if args.apply and not args.message:
+        parser.error("--apply needs --message")
+    if args.unified < 1:
+        parser.error("--unified must be at least 1")
+
+    try:
+        repo = Path(git(Path(args.repo).expanduser().resolve(), "rev-parse", "--show-toplevel").stdout.strip())
+        git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").stdout.strip())
+        prs = load_prs(args)
+        if not prs:
+            raise StackAbsorbError("no PRs selected")
+        stack = load_stack(repo, prs, args.edits)
+        pins = parse_pins(args.pin, prs)
+        diff = git(
+            repo,
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            f"--unified={args.unified}",
+            stack.heads[-1],
+            stack.edits,
+        ).stdout
+        hunks, unroutable = parse_diff(diff)
+        if not hunks and not unroutable:
+            raise StackAbsorbError("the edits commit changes nothing")
+
+        with tempfile.TemporaryDirectory(prefix="stack-absorb-") as scratch:
+            indexes = Indexes(repo, Path(scratch))
+            refusals = unroutable + route(stack, hunks, pins, indexes)
+            print(format_routing(stack, hunks))
+            if refusals:
+                print("\nRefused:")
+                for refusal in refusals:
+                    print(f"  {refusal}")
+                return 1
+            if args.message:
+                for target in {hunk.target for hunk in hunks}:
+                    format_message(args.message, prs[target])
+            built = build_commits(stack, hunks, Path(scratch), args.message)
+
+        print()
+        for target, commit in sorted(built.items()):
+            numbers = ", ".join(str(hunk.index) for hunk in hunks if hunk.target == target)
+            print(f"{prs[target].label}: hunk(s) {numbers}")
+        outcome = simulate(stack, built)
+        print(f"\nSimulation: {outcome}")
+        if outcome.startswith("MISMATCH"):
+            return 1
+        if not args.apply:
+            print("\nDry run only. Re-run with --apply --message '<template>' to write the commits and rebase.")
+            return 1 if outcome.startswith("CONFLICT") else 0
+
+        if git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+            raise StackAbsorbError("the working tree has uncommitted changes; commit or remove them first")
+        if (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+            raise StackAbsorbError("a rebase is already in progress")
+        elsewhere = branches_checked_out_elsewhere(repo, prs)
+        if elsewhere:
+            raise StackAbsorbError(
+                "git rebase --update-refs cannot move a branch checked out in another worktree: "
+                + ", ".join(elsewhere)
+                + ". Run the wave in a throwaway clone."
+            )
+        before = {pr.branch: find_oid(repo, f"refs/heads/{pr.branch}") for pr in prs}
+        print(flush=True)
+        replayed: list[str] = []
+        if run_rebase(stack, built, git_dir) != 0 and continue_with_rerere(repo, git_dir, prs, replayed) != 0:
+            print(f"\n{describe_stop(repo, git_dir, prs, built, replayed)}", file=sys.stderr)
+            return 1
+        print()
+        for pr in prs:
+            print(f"{pr.branch}: {before[pr.branch][:7]} -> {find_oid(repo, f'refs/heads/{pr.branch}')[:7]}")
+        if replayed:
+            print("\nrerere resolved:")
+            for line in replayed:
+                print(f"  {line}")
+        if tree_of(repo, prs[-1].branch) != tree_of(repo, stack.edits):
+            print(f"\nWARNING: {prs[-1].branch} does not match the edited tree; compare with git diff {prs[-1].branch} {stack.edits[:7]}")
+            return 1
+        print(f"\n{prs[-1].branch} matches the edited tree.")
+        return 0
+    except StackAbsorbError as exc:
+        print(f"stack-absorb: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
